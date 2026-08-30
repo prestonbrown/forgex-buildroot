@@ -133,6 +133,27 @@ its own register validation.
   every invocation, prints each ioctl step as it happens, and accepts
   only pc12 unless `--force-gpio` is passed. Note the watchdog bounds
   userspace waiting, not a thread already blocked in the kernel.
+- **A failed REQUEST wedges the channel (empirical):** every observed
+  D-state (three rig reboots) followed a REQUEST that failed with
+  -EBUSY; the next ioctl on that channel then blocks inside
+  mutex_lock forever (kernel stack: pwm2_request+0xac, the instruction
+  after the mutex_lock call). Statically the request error path does
+  unlock (branch to the LO16 with the HI16 in its delay slot) - the
+  wedge mechanism is unexplained, so fx-pwm treats any REQUEST failure
+  as wedging: it writes /run/fx-pwm.<gpio>.wedged and later invocations
+  refuse before entering the kernel until the next reboot.
+- **Who claims pc12 during a Forge-X boot (open):** on a fresh boot with
+  no fx-pwm/stock touches, gpio_request(PC12) returns -EBUSY. Leading
+  theory: the stock firmwareExe runs briefly at boot before Forge-X
+  disarms it - long enough to REQUEST pc12 through soc_pwm (the same
+  path stock beeps use), leaving a gpiolib claim that process death
+  never frees. That claim also sets the driver's requested flag, which
+  is why requests on the boot instance "succeed" (they take the
+  skip-path) while a reloaded instance fails. Identification, one
+  command: mount debugfs, then `cat /sys/kernel/debug/gpio` - pc12's
+  label will read `pwm13` if the claim came through soc_pwm (ours or
+  firmwareExe's), anything else names the real claimant. Note
+  clk_summary reads empty until debugfs is actually mounted.
 
 `fx-pwm probe <gpio>` is the first diagnostic to run anywhere: it
 reports the channel the KERNEL assigns to the gpio and changes no

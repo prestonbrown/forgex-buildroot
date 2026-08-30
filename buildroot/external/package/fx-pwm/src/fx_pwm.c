@@ -160,7 +160,49 @@ static int open_pwm_device(void)
 /*
  * REQUEST takes the gpio name string; the kernel maps it to its channel
  * index and RETURNS that index, which every later ioctl must use.
+ *
+ * A failed REQUEST (observed: -EBUSY when the gpio is already claimed)
+ * empirically wedges the channel: every later ioctl on it blocks in the
+ * kernel unkillably (D-state; three rig reboots were spent on this).
+ * Mark the gpio so later invocations refuse before entering the kernel,
+ * turning an unkillable hang into a clean error until the next reboot.
  */
+static void wedge_marker_path(char *buf, size_t cap, const char *gpio)
+{
+	char lower[16];
+
+	to_lowercase(lower, sizeof(lower), gpio);
+	snprintf(buf, cap, "/run/fx-pwm.%s.wedged", lower);
+}
+
+static void check_wedge_marker(const char *gpio)
+{
+	char path[64];
+	FILE *f;
+
+	wedge_marker_path(path, sizeof(path), gpio);
+	f = fopen(path, "r");
+	if (f) {
+		fclose(f);
+		die("error: %s was marked wedged by an earlier failed request this boot;\n"
+		    "further ioctls on it can block unkillably. Reboot to clear, or remove\n"
+		    "%s if you know better.\n", gpio, path);
+	}
+}
+
+static void write_wedge_marker(const char *gpio)
+{
+	char path[64];
+	FILE *f;
+
+	wedge_marker_path(path, sizeof(path), gpio);
+	f = fopen(path, "w");
+	if (f) {
+		fprintf(f, "request failed; channel mutex wedged\n");
+		fclose(f);
+	}
+}
+
 static int pwm_request_channel(int fd, const char *gpio)
 {
 	char name[12];
@@ -169,8 +211,16 @@ static int pwm_request_channel(int fd, const char *gpio)
 	to_lowercase(name, sizeof(name), gpio);
 	step("request %s ... ", name);
 	ch = ioctl(fd, PWM_IOC_REQUEST, name);
-	if (ch < 0)
+	if (ch < 0) {
+		int saved = errno;
+
+		write_wedge_marker(gpio);
+		errno = saved;
+		if (errno == EBUSY)
+			die("failed: %s (gpio already claimed - check /sys/kernel/debug/gpio\n"
+			    "for the claimant; dmesg has the driver's reason)\n", strerror(errno));
 		die("failed: %s (see dmesg for the driver's 'PWM:' reason)\n", strerror(errno));
+	}
 	step("kernel channel %ld\n", ch);
 	return (int)ch;
 }
@@ -556,6 +606,8 @@ int main(int argc, char **argv)
 	}
 
 	alarm(g_watchdog_seconds);
+
+	check_wedge_marker(argc >= 3 ? argv[2] : "pc12");
 
 	if (strcmp(verb, "--selftest") == 0) {
 		fd = open_pwm_device();
