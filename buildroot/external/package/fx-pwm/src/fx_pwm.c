@@ -258,11 +258,13 @@ static int cmd_set_level(int fd, const char *gpio, const char *level_s)
 
 static int cmd_get_level(int fd, const char *gpio)
 {
-	uint32_t ch = (uint32_t)pwm_request_channel(fd, gpio);
-	uint32_t level = ch;
+	struct pwm_level_args io;
 
-	xioctl(fd, PWM_IOC_GET_LEVEL, &level, "pwm_get_level");
-	printf("%s (ch%u) level %u\n", gpio, ch, level);
+	io.channel = (uint32_t)pwm_request_channel(fd, gpio);
+	io.level = 0;
+
+	xioctl(fd, PWM_IOC_GET_LEVEL, &io, "pwm_get_level");
+	printf("%s (ch%u) level %u\n", gpio, io.channel, io.level);
 	return 0;
 }
 

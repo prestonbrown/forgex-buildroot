@@ -49,9 +49,14 @@
 #define PWM_IOC_SET_LEVEL 0xc004502c /* _IOWR('P', 0x2c, 8) */
 
 /*
- * GET_LEVEL - arg is a uint32_t that carries the channel in and the current
- * level (0..max_level, scaled by the driver) out.
+ * GET_LEVEL - arg is an 8-byte struct: the channel is read from the first
+ * 4 bytes and the current level (0..max_level, scaled by the driver) is
+ * written to the SECOND 4 bytes (user arg+4), not in place.
  */
+struct pwm_level_args {
+	uint32_t channel;
+	uint32_t level;
+};
 #define PWM_IOC_GET_LEVEL 0xc004502b /* _IOWR('P', 0x2b, 4) */
 
 /* NOT_REALLY_ENABLE / _DISABLE - arg is struct pwm_ch_value; value unused. */
