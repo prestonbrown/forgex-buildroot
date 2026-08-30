@@ -119,20 +119,59 @@ its own register validation.
   falls through to a default that returns -1 (EPERM) with NO printk. So
   "Operation not permitted" with nothing in dmesg means the number did
   not match this build of the driver - not a permissions problem.
-- **Spinlock leak:** pwm2_config's rejection paths for max_level >= 65535
-  and freq above the parent clock rate branch to the epilogue PAST the
-  channel spin_unlock. After such a failure every later ioctl on that
-  channel blocks forever (until the module is reloaded). Keep max_level
-  < 65535 and config freq modest; fx-pwm's internal config uses 1 MHz
-  for exactly this reason.
-- Consequently fx-pwm arms an alarm() watchdog (default 5 s,
-  `--timeout=<s>`) around every invocation, prints each ioctl step as it
-  happens (so a hang is visible at the exact call), and accepts only
-  pc12 unless `--force-gpio` is passed.
+- **REQUEST is a gpio lease:** pwm2_request internally calls the
+  kernel's gpio_request(); pwm2_release calls gpio_free(). A process
+  that REQUESTs and exits without RELEASE leaves the gpio claimed in
+  gpiolib forever (the misc device's release fop frees nothing). Later
+  REQUESTs still succeed because pwm2_request short-circuits when the
+  channel is already requested - but rmmod'ing soc_pwm orphans the
+  claim: the fresh instance's REQUEST fails loudly ("request IO <gpio>
+  error !") and, on this vendor stack, a subsequent REQUEST can wedge
+  uninterruptibly (D-state; soc_gpio lock path). NEVER rmmod soc_pwm
+  after unreleased requests; a reboot is the only clean reset.
+- fx-pwm arms an alarm() watchdog (default 5 s, `--timeout=<s>`) around
+  every invocation, prints each ioctl step as it happens, and accepts
+  only pc12 unless `--force-gpio` is passed. Note the watchdog bounds
+  userspace waiting, not a thread already blocked in the kernel.
 
 `fx-pwm probe <gpio>` is the first diagnostic to run anywhere: it
 reports the channel the KERNEL assigns to the gpio and changes no
 output.
+
+## The parent clock and the boot-state dependency (open)
+
+The driver's probe (clock names decoded from the module: `div_ahb2`,
+`div_pwm`, `gate_pwm`) reads div_ahb2's rate, then checks
+`__clk_is_enabled(gate_pwm)`: if the gate is ALREADY enabled it skips
+clock setup entirely and leaves its rate variable at the built-in
+500 MHz default; otherwise it runs `clk_set_rate(div_pwm, 500000000)`
+plus prepare/enable, and the dance's return value overwrites the rate
+variable. pwm2_config rejects any freq above that rate variable.
+
+Rig observation (2026-08-30): on a Forge-X boot, config(freq=1 MHz)
+was rejected, implying the rate variable ended up near zero - i.e. the
+gate was off at probe time and the setup dance produced ~0. On stock
+boots the gate is already enabled by earlier boot activity, the dance
+is skipped, and the 500 MHz default holds. This is the leading theory
+for the whole "works on stock, EPERMs under Forge-X" matrix; the
+next-session runbook below settles it.
+
+Bring-up runbook (in this order, stock-side dmesg reads):
+1. Reboot; wait for the UI; do NOT run fx-pwm yet.
+2. `dmesg | grep -i pwm` - probe-time clk errors print here.
+3. `cat /sys/kernel/debug/clk/clk_summary | grep -iE 'pwm|ahb'` -
+   div_pwm's rate and enable count, the ground truth for the theory.
+4. `rmmod soc_pwm && insmod /module_driver/soc_pwm.ko` - re-probe now
+   that boot services may have enabled the gate (safe: nothing has
+   requested pc12 yet, so no orphaned claim).
+5. clk_summary again; note whether div_pwm changed.
+6. `fx-pwm probe pc12 --timeout=3` (expect channel 13).
+7. `fx-pwm config pc12 freq=1000000 max_level=300 active_level=1 accuracy_priority=freq`
+   then `dmesg | grep -i pwm`. A "frequency low than <N>" line names the
+   live rate N; retry with freq <= N if needed.
+8. `fx-pwm set_prescale pc12 6; fx-pwm set_wc pc12 1600 1600` - listen.
+   Then `fx-pwm selftest` for the parent-rate bracket, and
+   `fx-pwm disable pc12` to silence.
 
 ## PWM2 register map (informational)
 
