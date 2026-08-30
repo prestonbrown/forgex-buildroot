@@ -10,6 +10,12 @@
  * to the same /dev/jz_pwm ioctl ABI directly, so the chroot needs nothing
  * from the OEM userland.
  *
+ * Channel numbers are NOT guessed locally: every verb first issues the
+ * REQUEST ioctl with the gpio NAME and uses the channel index the kernel
+ * returns (the same thing the stock library does). A firmware update that
+ * reshuffles the driver's pwm_gpio_array therefore cannot make this tool
+ * poke the wrong channel.
+ *
  * The command surface mirrors cmd_pwm so existing call sites (M300 beep
  * hooks, macros) work unchanged:
  *
@@ -24,18 +30,22 @@
  *   fx-pwm not_really_enable <gpio>
  *   fx-pwm not_really_disable <gpio>
  *   fx-pwm tone <gpio> <notes> [--base=<hz>] [--prescale=<n>]
+ *   fx-pwm probe <gpio>
  *   fx-pwm selftest [gpio] [--tone-hz=<f>] [--prescale=<n>] [--ms=<n>]
  *
- * Every verb re-requests the gpio (the kernel treats a double request as a
- * no-op) and leaves the channel in the state the verb produced; only
- * `disable`/`disable_channels` tear output down. The kernel driver does the
- * claim-checking: unknown gpios, unconfigured channels, over-max levels and
- * reconfigures-while-running are all rejected server-side (reasons land in
- * dmesg, prefixed "PWM:").
+ * Safety rails: only pc12 (the buzzer) is accepted unless --force-gpio
+ * names another gpio explicitly, and every process arms an alarm() watchdog
+ * (default 5 s, --timeout=<s>) so no verb can hang forever. The watchdog
+ * exists because the stock driver leaks the channel spinlock on two of
+ * pwm2_config's error paths (max_level >= 65535, freq above the parent
+ * clock rate): after such a failure every later ioctl on that channel
+ * blocks until the module is reloaded. A verb that dies to the watchdog
+ * has usually just taken that path - check dmesg for the "PWM:" line.
  */
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -50,36 +60,27 @@
 #define PWM_DEVICE      "/dev/jz_pwm"
 #define PWM_DEVICE_ALT  "/dev/misc/jz_pwm"
 
-/*
- * gpio name -> channel index, transcribed from the vendor driver's
- * pwm_gpio_array (17 entries; gpio id = (port<<4)|pin, pc12 = 0x2c).
- * Only entries the kernel table marks PWM-capable are listed; anything
- * else on this SoC cannot be muxed to PWM and is refused here before the
- * kernel ever sees it. pc12 is the AD5X buzzer.
- */
-struct gpio_channel {
-	const char *name;
-	uint32_t channel;
-};
+static int g_watchdog_seconds = 5;
 
-static const struct gpio_channel pwm_gpios[] = {
-	{ "pc12", 0 },  /* AD5X buzzer */
-	{ "pc13", 1 },
-	{ "pc14", 2 },
-	{ "pc15", 3 },
-	{ "pc16", 4 },
-	{ "pc17", 5 },
-	{ "pc18", 6 },
-	{ "pc19", 7 },
-	/* gpio id 0x82 (port 8, pin 2) is also PWM-capable per the vendor
-	 * table; its port letter is not verified, and no AD5X hardware is
-	 * known to use it, so it is deliberately not exposed. */
-};
+/*
+ * gpio allowlist. The kernel driver's own table (pwm_gpio_array, decoded
+ * from the vendor module) maps, with gpio ids encoded (port<<5)|pin:
+ *
+ *   pb12..pb19 -> pwm0..pwm7   (ids 0x2c..0x33)
+ *   pc7..pc14  -> pwm8..pwm15  (ids 0x47..0x4e)
+ *   pe2        -> pwm10 alt    (id 0x82)
+ *
+ * so pc12, the AD5X buzzer, is pwm13/channel 13. Only the buzzer is
+ * exposed by default: the wiring of the other pins is unknown and some
+ * may drive fans or LEDs. The channel number is still taken from the
+ * kernel at runtime, never from this table.
+ */
+static const char *const allowed_gpios[] = { "pc12" };
 
 static void usage(FILE *out)
 {
 	fprintf(out,
-"Usage: fx-pwm <verb> <gpio> [args]\n"
+"Usage: fx-pwm <verb> <gpio> [args] [--timeout=<s>] [--force-gpio]\n"
 "\n"
 "  config <gpio> freq=<hz> max_level=<n> [active_level=<0|1>] [accuracy_priority=freq|levels]\n"
 "  set_level <gpio> <level>\n"
@@ -93,17 +94,21 @@ static void usage(FILE *out)
 "  not_really_disable <gpio>\n"
 "  tone <gpio> <notes> [--base=<hz>] [--prescale=<n>]\n"
 "                                  (notes: \"freq:ms ...\"; bare number = rest ms)\n"
+"  probe <gpio>                    (request, report the kernel's channel, no output change)\n"
 "  selftest [gpio] [--tone-hz=<f>] [--prescale=<n>] [--ms=<n>]\n"
 "  --selftest                       (same as: selftest pc12)\n"
 "\n"
 "Examples (stock parity, as firmwareExe drives the buzzer):\n"
-"  fx-pwm config pc12 freq=50000000 max_level=300 active_level=1 accuracy_priority=freq\n"
+"  fx-pwm config pc12 freq=1000000 max_level=300 active_level=1 accuracy_priority=freq\n"
 "  fx-pwm set_prescale pc12 6\n"
 "  fx-pwm set_wc pc12 1600 1600\n"
 "  fx-pwm set_level pc12 100\n"
 "  fx-pwm disable pc12\n"
 "\n"
-"PWM-capable gpios on this SoC: pc12 (buzzer) pc13 pc14 pc15 pc16 pc17 pc18 pc19\n");
+"Only pc12 (the buzzer) is accepted unless --force-gpio is given.\n"
+"Every process arms a %d s alarm() watchdog (--timeout=<s> to change); see\n"
+"the header comment for why a verb can otherwise hang forever.\n",
+		g_watchdog_seconds);
 }
 
 static void die(const char *fmt, ...)
@@ -116,21 +121,23 @@ static void die(const char *fmt, ...)
 	exit(1);
 }
 
-static int lookup_channel(const char *gpio)
+static void step(const char *fmt, ...)
 {
-	char lower[16];
+	va_list ap;
+
+	va_start(ap, fmt);
+	vprintf(fmt, ap);
+	va_end(ap);
+	fflush(stdout);
+}
+
+static void to_lowercase(char *dst, size_t cap, const char *src)
+{
 	size_t i;
 
-	for (i = 0; gpio[i] && i < sizeof(lower) - 1; i++)
-		lower[i] = (char)((gpio[i] >= 'A' && gpio[i] <= 'Z') ? gpio[i] + 32 : gpio[i]);
-	lower[i] = '\0';
-
-	for (i = 0; i < sizeof(pwm_gpios) / sizeof(pwm_gpios[0]); i++)
-		if (strcmp(lower, pwm_gpios[i].name) == 0)
-			return (int)pwm_gpios[i].channel;
-
-	die("error: %s is not a pwm-capable gpio on this SoC (supported: pc12..pc19)\n", gpio);
-	return -1;
+	for (i = 0; src[i] && i < cap - 1; i++)
+		dst[i] = (char)((src[i] >= 'A' && src[i] <= 'Z') ? src[i] + 32 : src[i]);
+	dst[i] = '\0';
 }
 
 static int open_pwm_device(void)
@@ -150,24 +157,39 @@ static int open_pwm_device(void)
 	return fd;
 }
 
-/* REQUEST takes the gpio name string; the kernel maps it to the channel. */
-static void pwm_request_gpio(int fd, const char *gpio)
+/*
+ * REQUEST takes the gpio name string; the kernel maps it to its channel
+ * index and RETURNS that index, which every later ioctl must use.
+ */
+static int pwm_request_channel(int fd, const char *gpio)
 {
 	char name[12];
-	size_t i;
+	long ch;
 
-	for (i = 0; gpio[i] && i < sizeof(name) - 1; i++)
-		name[i] = (char)((gpio[i] >= 'A' && gpio[i] <= 'Z') ? gpio[i] + 32 : gpio[i]);
-	name[i] = '\0';
-
-	if (ioctl(fd, PWM_IOC_REQUEST, name) < 0)
-		die("error: pwm_request %s failed: %s (see dmesg)\n", gpio, strerror(errno));
+	to_lowercase(name, sizeof(name), gpio);
+	step("request %s ... ", name);
+	ch = ioctl(fd, PWM_IOC_REQUEST, name);
+	if (ch < 0)
+		die("failed: %s (see dmesg for the driver's 'PWM:' reason)\n", strerror(errno));
+	step("kernel channel %ld\n", ch);
+	return (int)ch;
 }
 
 static void xioctl(int fd, unsigned long req, void *arg, const char *what)
 {
+	step("%s ... ", what);
+	fflush(stdout);
 	if (ioctl(fd, req, arg) < 0)
-		die("error: %s failed: %s (see dmesg)\n", what, strerror(errno));
+		die("failed: %s (see dmesg for the driver's 'PWM:' reason)\n", strerror(errno));
+	step("ok\n");
+}
+
+static void pwm_release_channel(int fd, int ch, const char *gpio)
+{
+	step("release %s (ch%d) ... ", gpio, ch);
+	if (ioctl(fd, PWM_IOC_RELEASE, (unsigned long)ch) < 0)
+		die("failed: %s\n", strerror(errno));
+	step("ok\n");
 }
 
 static int parse_long(const char *s, const char *what)
@@ -184,12 +206,11 @@ static int cmd_config(int fd, const char *gpio, int argc, char **argv)
 {
 	struct pwm_config_args cfg;
 	const char *accuracy = "freq";
-	int i;
+	int i, ch;
 
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.active_level = 1;
 	cfg.levels_exact = 0;
-	cfg.channel = (uint32_t)lookup_channel(gpio);
 
 	for (i = 0; i < argc; i++) {
 		if (strncmp(argv[i], "freq=", 5) == 0)
@@ -200,7 +221,7 @@ static int cmd_config(int fd, const char *gpio, int argc, char **argv)
 			cfg.active_level = (uint32_t)parse_long(argv[i] + 13, "active_level");
 		else if (strncmp(argv[i], "accuracy_priority=", 18) == 0)
 			accuracy = argv[i] + 18;
-		else
+		else if (strncmp(argv[i], "--", 2) != 0)
 			die("error: not support this arg: %s\n", argv[i]);
 	}
 
@@ -215,10 +236,11 @@ static int cmd_config(int fd, const char *gpio, int argc, char **argv)
 	else
 		die("error: accuracy_priority must be freq or levels\n");
 
-	pwm_request_gpio(fd, gpio);
+	ch = pwm_request_channel(fd, gpio);
+	cfg.channel = (uint32_t)ch;
 	xioctl(fd, PWM_IOC_CONFIG, &cfg, "pwm_config");
-	printf("configured %s (ch%u): freq=%u max_level=%u active_level=%u accuracy_priority=%s\n",
-	       gpio, cfg.channel, cfg.freq_hz, cfg.max_level, cfg.active_level, accuracy);
+	printf("configured %s (ch%d): freq=%u max_level=%u active_level=%u accuracy_priority=%s\n",
+	       gpio, ch, cfg.freq_hz, cfg.max_level, cfg.active_level, accuracy);
 	return 0;
 }
 
@@ -226,10 +248,9 @@ static int cmd_set_level(int fd, const char *gpio, const char *level_s)
 {
 	struct pwm_ch_value v;
 
-	v.channel = (uint32_t)lookup_channel(gpio);
+	v.channel = (uint32_t)pwm_request_channel(fd, gpio);
 	v.value = (uint32_t)parse_long(level_s, "level");
 
-	pwm_request_gpio(fd, gpio);
 	xioctl(fd, PWM_IOC_SET_LEVEL, &v, "pwm_set_level");
 	printf("%s level %u\n", gpio, v.value);
 	return 0;
@@ -237,11 +258,11 @@ static int cmd_set_level(int fd, const char *gpio, const char *level_s)
 
 static int cmd_get_level(int fd, const char *gpio)
 {
-	uint32_t ch = (uint32_t)lookup_channel(gpio);
+	uint32_t ch = (uint32_t)pwm_request_channel(fd, gpio);
+	uint32_t level = ch;
 
-	pwm_request_gpio(fd, gpio);
-	xioctl(fd, PWM_IOC_GET_LEVEL, &ch, "pwm_get_level");
-	printf("%u\n", ch);
+	xioctl(fd, PWM_IOC_GET_LEVEL, &level, "pwm_get_level");
+	printf("%s (ch%u) level %u\n", gpio, ch, level);
 	return 0;
 }
 
@@ -254,10 +275,9 @@ static int cmd_set_wc(int fd, const char *gpio, const char *high_s, const char *
 	if (high < 0 || high > 0xffff || low < 0 || low > 0xffff)
 		die("error: set_wc halves must be 0..65535\n");
 
-	v.channel = (uint32_t)lookup_channel(gpio);
+	v.channel = (uint32_t)pwm_request_channel(fd, gpio);
 	v.value = PWM_WC(high, low);
 
-	pwm_request_gpio(fd, gpio);
 	xioctl(fd, PWM_IOC_SET_WC, &v, "pwm_set_wc");
 	printf("%s duty: active %d counts, inactive %d counts\n", gpio, low, high);
 	return 0;
@@ -267,24 +287,25 @@ static int cmd_set_prescale(int fd, const char *gpio, const char *div_s)
 {
 	struct pwm_ch_value v;
 
-	v.channel = (uint32_t)lookup_channel(gpio);
+	v.channel = (uint32_t)pwm_request_channel(fd, gpio);
 	v.value = (uint32_t)parse_long(div_s, "prescale");
 	if (v.value == 0 || v.value >= 0x10000)
 		die("error: prescale must be 1..65535 (channel clock = parent / prescale)\n");
 
-	pwm_request_gpio(fd, gpio);
 	xioctl(fd, PWM_IOC_SET_PRESCALE, &v, "pwm_set_prescale");
 	printf("%s channel clock = parent / %u\n", gpio, v.value);
 	return 0;
 }
 
-/* RELEASE passes the channel BY VALUE - see pwm_abi.h. */
 static int cmd_disable(int fd, const char *gpio)
 {
-	uint32_t ch = (uint32_t)lookup_channel(gpio);
+	int ch = pwm_request_channel(fd, gpio);
 
+	/* RELEASE passes the channel BY VALUE - see pwm_abi.h. */
+	step("pwm_release ... ");
 	if (ioctl(fd, PWM_IOC_RELEASE, (unsigned long)ch) < 0)
-		die("error: pwm_release %s failed: %s (see dmesg)\n", gpio, strerror(errno));
+		die("failed: %s (see dmesg)\n", strerror(errno));
+	step("ok\n");
 	printf("%s disabled\n", gpio);
 	return 0;
 }
@@ -294,8 +315,11 @@ static int cmd_channels(int fd, int argc, char **argv, unsigned long req, const 
 	uint32_t mask = 0;
 	int i;
 
-	for (i = 0; i < argc; i++)
-		mask |= 1u << lookup_channel(argv[i]);
+	for (i = 0; i < argc; i++) {
+		if (strncmp(argv[i], "--", 2) == 0)
+			continue;
+		mask |= 1u << pwm_request_channel(fd, argv[i]);
+	}
 
 	xioctl(fd, req, &mask, what);
 	printf("%s mask 0x%x\n", what, mask);
@@ -306,10 +330,25 @@ static int cmd_not_really(int fd, const char *gpio, unsigned long req, const cha
 {
 	struct pwm_ch_value v;
 
-	v.channel = (uint32_t)lookup_channel(gpio);
+	v.channel = (uint32_t)pwm_request_channel(fd, gpio);
 	v.value = 0;
 	xioctl(fd, req, &v, what);
 	printf("%s %s\n", gpio, what);
+	return 0;
+}
+
+/* Diagnostics only: report the kernel's channel for a gpio, change nothing. */
+static int cmd_probe(int fd, const char *gpio)
+{
+	uint32_t level;
+	int ch = pwm_request_channel(fd, gpio);
+
+	level = (uint32_t)ch;
+	if (ioctl(fd, PWM_IOC_GET_LEVEL, &level) == 0)
+		printf("%s -> kernel channel %d, current level %u\n", gpio, ch, level);
+	else
+		printf("%s -> kernel channel %d (get_level: %s)\n", gpio, ch, strerror(errno));
+	pwm_release_channel(fd, ch, gpio);
 	return 0;
 }
 
@@ -321,32 +360,39 @@ static int cmd_not_really(int fd, const char *gpio, unsigned long req, const cha
  * its sysfs-PWMAudio backend for this tool without touching note parsing.
  *
  * One process plays the whole sequence in-process (no fork per note);
- * duty is fixed 50%, the loudest drive for a piezo. The parent clock rate
- * is assumed 50 MHz (stock parity) and can be overridden once the real
- * rate is measured on a machine.
+ * duty is fixed 50%, the loudest drive for a piezo. The channel clock is
+ * base/prescale with base defaulting to the stock 50 MHz assumption; once
+ * the real parent rate is measured on a machine, pass --base=.
  */
 static int cmd_tone(int fd, const char *gpio, const char *notes, long base, long prescale)
 {
 	struct pwm_config_args cfg;
 	struct pwm_ch_value v;
 	const char *p = notes;
-	uint32_t ch = (uint32_t)lookup_channel(gpio);
 	long clock = base / prescale;
+	int ch;
 
 	if (clock <= 0)
 		die("error: base clock %ld / prescale %ld is not positive\n", base, prescale);
 
+	/*
+	 * config's freq is only bookkeeping for this flow (set_prescale and
+	 * set_wc override the clock and the duty halves), so ask for a
+	 * conservative 1 MHz: any parent rate accepts it, and the two
+	 * pwm2_config error paths that would fail (and leak the channel
+	 * spinlock) are freq-above-parent and max_level-out-of-range.
+	 */
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.active_level = 1;
 	cfg.levels_exact = 0;
-	cfg.freq_hz = (uint32_t)base; /* stock parity: parent rate */
+	cfg.freq_hz = 1000000;
 	cfg.max_level = 300;
-	cfg.channel = ch;
 
-	pwm_request_gpio(fd, gpio);
+	ch = pwm_request_channel(fd, gpio);
+	cfg.channel = (uint32_t)ch;
 	xioctl(fd, PWM_IOC_CONFIG, &cfg, "pwm_config");
 
-	v.channel = ch;
+	v.channel = (uint32_t)ch;
 	v.value = (uint32_t)prescale;
 	xioctl(fd, PWM_IOC_SET_PRESCALE, &v, "pwm_set_prescale");
 
@@ -393,18 +439,17 @@ static int cmd_tone(int fd, const char *gpio, const char *notes, long base, long
 
 	v.value = PWM_WC(0, 0);
 	xioctl(fd, PWM_IOC_SET_WC, &v, "pwm_set_wc");
-	if (ioctl(fd, PWM_IOC_RELEASE, (unsigned long)ch) < 0)
-		die("error: pwm_release failed: %s (see dmesg)\n", strerror(errno));
+	pwm_release_channel(fd, ch, gpio);
 	return 0;
 }
 
 /*
  * Bring-up aid for a human listening: stock-parity config, then two tones
- * whose period counts bracket the two plausible parent-clock rates (the
- * vendor driver defaults its rate global to 500 MHz before clk_get_rate;
- * the stock buzzer stack assumes 50 MHz), then a clean disable. If the
- * first tone is silent but the second is audible (or vice versa), the
- * parent clock differs from the assumption and tone math should be redone
+ * whose period counts bracket the plausible parent-clock rates (the vendor
+ * driver defaults its rate global to 500 MHz before clk_get_rate; the
+ * stock buzzer stack assumes 50 MHz), then a clean disable. If the first
+ * tone is silent but the second is audible (or vice versa), the parent
+ * clock differs from the assumption and tone math should be redone
  * against the measured rate.
  */
 static int cmd_selftest(int fd, int argc, char **argv)
@@ -420,6 +465,7 @@ static int cmd_selftest(int fd, int argc, char **argv)
 	struct pwm_config_args cfg;
 	struct pwm_ch_value v;
 	size_t t;
+	int ch;
 
 	for (int i = 0; i < argc; i++) {
 		if (strncmp(argv[i], "--tone-hz=", 10) == 0)
@@ -432,20 +478,18 @@ static int cmd_selftest(int fd, int argc, char **argv)
 			gpio = argv[i];
 	}
 
-	uint32_t ch = (uint32_t)lookup_channel(gpio);
-
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.active_level = 1;
 	cfg.levels_exact = 0;
-	cfg.freq_hz = 50000000; /* stock parity: parent rate */
+	cfg.freq_hz = 1000000; /* conservative: see cmd_tone */
 	cfg.max_level = 300;
-	cfg.channel = ch;
 
-	printf("selftest on %s (ch%u): request + config (stock parity)...\n", gpio, ch);
-	pwm_request_gpio(fd, gpio);
+	printf("selftest on %s: config (max_level 300) ...\n", gpio);
+	ch = pwm_request_channel(fd, gpio);
+	cfg.channel = (uint32_t)ch;
 	xioctl(fd, PWM_IOC_CONFIG, &cfg, "pwm_config");
 
-	v.channel = ch;
+	v.channel = (uint32_t)ch;
 	v.value = (uint32_t)prescale;
 	xioctl(fd, PWM_IOC_SET_PRESCALE, &v, "pwm_set_prescale");
 	printf("prescale %ld -> channel clock = parent / %ld\n", prescale, prescale);
@@ -467,6 +511,7 @@ static int cmd_selftest(int fd, int argc, char **argv)
 		v.value = PWM_WC(total - half, half);
 		printf("tone %u: %ld counts total (%s), %ld ms...\n",
 		       (unsigned)(t + 1), total, note, ms);
+		fflush(stdout);
 		xioctl(fd, PWM_IOC_SET_WC, &v, "pwm_set_wc");
 		usleep((useconds_t)ms * 1000);
 
@@ -475,8 +520,7 @@ static int cmd_selftest(int fd, int argc, char **argv)
 		usleep(150000);
 	}
 
-	if (ioctl(fd, PWM_IOC_RELEASE, (unsigned long)ch) < 0)
-		die("error: pwm_release failed: %s (see dmesg)\n", strerror(errno));
+	pwm_release_channel(fd, ch, gpio);
 	printf("released. If no tone was audible, check dmesg for 'PWM:' lines and\n"
 	       "verify /dev/jz_pwm reaches this chroot (see package README).\n");
 	return 0;
@@ -484,12 +528,24 @@ static int cmd_selftest(int fd, int argc, char **argv)
 
 int main(int argc, char **argv)
 {
-	int fd;
+	int fd, i, force_gpio = 0;
 
 	if (argc < 2) {
 		usage(stderr);
 		return 1;
 	}
+
+	/* Global options may appear anywhere; strip them before dispatch. */
+	for (i = 1; i < argc; i++) {
+		if (strncmp(argv[i], "--timeout=", 10) == 0) {
+			g_watchdog_seconds = parse_long(argv[i] + 10, "timeout");
+			if (g_watchdog_seconds < 1 || g_watchdog_seconds > 60)
+				die("error: --timeout must be 1..60 seconds\n");
+		} else if (strcmp(argv[i], "--force-gpio") == 0) {
+			force_gpio = 1;
+		}
+	}
+
 	const char *verb = argv[1];
 
 	if (strcmp(verb, "-h") == 0 || strcmp(verb, "--help") == 0) {
@@ -497,14 +553,32 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
-	fd = open_pwm_device();
+	alarm(g_watchdog_seconds);
 
-	if (strcmp(verb, "--selftest") == 0)
+	if (strcmp(verb, "--selftest") == 0) {
+		fd = open_pwm_device();
 		return cmd_selftest(fd, argc - 2, argv + 2);
+	}
 
 	if (argc < 3)
 		die("error: verb %s needs a gpio argument\n", verb);
 	const char *gpio = argv[2];
+
+	if (!force_gpio) {
+		char lower[16];
+		size_t k;
+		int ok = 0;
+
+		to_lowercase(lower, sizeof(lower), gpio);
+		for (k = 0; k < sizeof(allowed_gpios) / sizeof(allowed_gpios[0]); k++)
+			if (strcmp(lower, allowed_gpios[k]) == 0)
+				ok = 1;
+		if (!ok)
+			die("error: %s is not in the allowlist (pc12, the buzzer); the wiring of\n"
+			    "other pwm gpios is unknown - use --force-gpio deliberately\n", gpio);
+	}
+
+	fd = open_pwm_device();
 
 	if (strcmp(verb, "config") == 0) {
 		if (argc < 4)
@@ -540,7 +614,6 @@ int main(int argc, char **argv)
 		return cmd_not_really(fd, gpio, PWM_IOC_NOT_REALLY_DISABLE, "pwm_not_really_disable");
 	if (strcmp(verb, "tone") == 0) {
 		long base = 50000000, prescale = 6;
-		int i;
 
 		if (argc < 4)
 			die("error: tone needs a notes string, e.g. \"1000:100 50 1479:200\"\n");
@@ -549,11 +622,13 @@ int main(int argc, char **argv)
 				base = parse_long(argv[i] + 7, "base");
 			else if (strncmp(argv[i], "--prescale=", 11) == 0)
 				prescale = parse_long(argv[i] + 11, "prescale");
-			else
+			else if (strncmp(argv[i], "--", 2) != 0)
 				die("error: not support this arg: %s\n", argv[i]);
 		}
 		return cmd_tone(fd, gpio, argv[3], base, prescale);
 	}
+	if (strcmp(verb, "probe") == 0)
+		return cmd_probe(fd, gpio);
 	if (strcmp(verb, "selftest") == 0)
 		return cmd_selftest(fd, argc - 2, argv + 2);
 

@@ -69,10 +69,14 @@ strings. Nothing came from any third-party mod.
   no X2600 DTS either. There is no mainline register map to cite - which
   is fine, because this tool pokes no registers; the stock GPL kernel
   module owns the block and does every write.
-- The driver's channel table (`pwm_gpio_array`) maps **pc12..pc19 to
-  channels 0..7** ("pwm0".."pwm7"; gpio id encoding is `(port<<4)|pin`,
-  so pc12 = 0x2c = 44). The earlier note "channel 3" was a misread of the
-  stock constants; pc12 is channel 0.
+- The driver's channel table (`pwm_gpio_array`) uses gpio ids encoded
+  **(port<<5)|pin** (pc12 = 0x4c = 76) and maps:
+  pb12..pb19 -> pwm0..pwm7, pc7..pc14 -> pwm8..pwm15, pe2 -> pwm10 (alt).
+  **pc12, the buzzer, is pwm13 = channel 13.** fx-pwm never relies on
+  this: every verb sends the gpio NAME in the REQUEST ioctl and uses the
+  channel index the kernel returns, so a firmware update that reshuffles
+  the table cannot redirect the tool. (Confirmed on the rig: the kernel
+  resolves pc12 -> 13.)
 - Clocking: the driver takes its parent rate from the DT clocks
   `div_ahb2`/`div_pwm`/`gate_pwm`, defaulting its rate variable to
   **500 MHz** before `clk_get_rate()`. The stock buzzer stack is written
@@ -108,6 +112,27 @@ The kernel rejects invalid gpios, unconfigured channels, levels above
 max_level, and reconfiguration while running (printed to dmesg as
 `PWM: ...`), which is the claim-checking this tool relies on instead of
 its own register validation.
+
+## Driver bugs to design around (decoded from the vendor module)
+
+- **Silent EPERM:** an ioctl number the dispatcher does not recognize
+  falls through to a default that returns -1 (EPERM) with NO printk. So
+  "Operation not permitted" with nothing in dmesg means the number did
+  not match this build of the driver - not a permissions problem.
+- **Spinlock leak:** pwm2_config's rejection paths for max_level >= 65535
+  and freq above the parent clock rate branch to the epilogue PAST the
+  channel spin_unlock. After such a failure every later ioctl on that
+  channel blocks forever (until the module is reloaded). Keep max_level
+  < 65535 and config freq modest; fx-pwm's internal config uses 1 MHz
+  for exactly this reason.
+- Consequently fx-pwm arms an alarm() watchdog (default 5 s,
+  `--timeout=<s>`) around every invocation, prints each ioctl step as it
+  happens (so a hang is visible at the exact call), and accepts only
+  pc12 unless `--force-gpio` is passed.
+
+`fx-pwm probe <gpio>` is the first diagnostic to run anywhere: it
+reports the channel the KERNEL assigns to the gpio and changes no
+output.
 
 ## PWM2 register map (informational)
 

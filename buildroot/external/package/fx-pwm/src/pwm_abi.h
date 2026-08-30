@@ -21,9 +21,11 @@
 /*
  * REQUEST - arg is a char[12] buffer holding the GPIO name string
  * ("pc12"). The kernel resolves it via str_to_gpio() (utils.ko; id encoding
- * is (port<<4)|pin, so pc12 = 0x2c = 44) against its pwm_gpio_array and
- * calls pwm2_request(). Idempotent: requesting an already-requested channel
- * is a no-op.
+ * is (port<<5)|pin, so pc12 = 0x4c = 76) against its pwm_gpio_array, and
+ * the ioctl RETURNS the channel index for that gpio (pc12 -> 13, "pwm13"
+ * in the vendor table). Clients must use that returned index in every
+ * later struct - do not guess channel numbers locally. Idempotent:
+ * requesting an already-requested channel is a no-op.
  */
 #define PWM_IOC_REQUEST 0x8001500b /* _IOR('P', 0x0b, char[12]) */
 
@@ -66,8 +68,15 @@
 
 /*
  * struct pwm_config_args field order matches what pwm2_config() reads.
- * The channel index is the driver's pwmdata index, NOT the gpio id:
- * pc12..pc19 are channels 0..7 ("pwm0".."pwm7" in the kernel's table).
+ * The channel index is the driver's pwmdata index, NOT the gpio id, and
+ * comes from the REQUEST ioctl's return value (vendor table: pb12..pb19
+ * are pwm0..pwm7, pc7..pc14 are pwm8..pwm15, so pc12 -> 13).
+ *
+ * Beware: two of pwm2_config's rejection paths (max_level >= 65535 and
+ * freq_hz above the parent clock rate) return without unlocking the
+ * channel spinlock, so after such a failure every later ioctl on that
+ * channel blocks until the module is reloaded. Keep max_level < 65535 and
+ * freq_hz at or below any plausible parent rate.
  */
 struct pwm_config_args {
 	uint32_t _reserved;    /* @0: not read by the driver */
@@ -75,7 +84,7 @@ struct pwm_config_args {
 	uint32_t levels_exact; /* @8: see below */
 	uint32_t freq_hz;      /* @12: target output frequency, nonzero */
 	uint32_t max_level;    /* @16: level scale, 1..65534 */
-	uint32_t channel;      /* @20: channel index (pc12 -> 0) */
+	uint32_t channel;      /* @20: channel index from REQUEST (pc12 -> 13) */
 };
 
 /*
