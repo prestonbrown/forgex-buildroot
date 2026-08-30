@@ -27,9 +27,31 @@ fx-pwm disable pc12
 
 Run `fx-pwm --help` for the full verb list (`config`, `set_level`,
 `get_level`, `set_wc`, `set_prescale`, `disable`, `enable_channels`,
-`disable_channels`, `not_really_enable/disable`, `selftest`). `selftest`
-plays two tones bracketing the plausible parent-clock rates and then
-releases the channel - it exists for bring-up with a human listening.
+`disable_channels`, `not_really_enable/disable`, `tone`, `selftest`).
+`selftest` plays two tones bracketing the plausible parent-clock rates and
+then releases the channel - it exists for bring-up with a human listening.
+
+## The tone verb and Forge-X's TONE command
+
+Forge-X's Klipper plugin `tone_player.py` (the `TONE` command behind its
+`M300`/`BEEP`/`M356` macros) drives the buzzer through
+`/sys/class/pwm/pwmchip0/pwm6` - the sysfs PWM API, which the AD5X's stock
+kernel does not provide (the AD5M kernel does; the plugin was written
+against it). On the AD5X every `TONE` therefore fails to reach hardware.
+
+`fx-pwm tone` accepts the plugin's NOTES grammar verbatim
+(`"freq:ms freq:ms 50"` - a bare number is a rest) and plays the whole
+sequence in one process, so the plugin port is a backend swap:
+
+```python
+subprocess.Popen(["/usr/bin/fx-pwm", "tone", "pc12", notes_str])
+```
+
+`M300 S0 P1` (HelixScreen's silence command) arrives as `NOTES="0:1"` -
+a rest, which this verb treats as output-off for the note's duration, so
+it is a no-op on silence. A `Popen` (not `run`) keeps the gcode queue
+free: the tone plays while klippy moves on; the current plugin's
+`reactor.pause`-per-note blocking disappears with the port.
 
 ## Hardware facts (with provenance)
 

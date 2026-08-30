@@ -23,6 +23,7 @@
  *   fx-pwm disable_channels <gpio> [gpio ...]
  *   fx-pwm not_really_enable <gpio>
  *   fx-pwm not_really_disable <gpio>
+ *   fx-pwm tone <gpio> <notes> [--base=<hz>] [--prescale=<n>]
  *   fx-pwm selftest [gpio] [--tone-hz=<f>] [--prescale=<n>] [--ms=<n>]
  *
  * Every verb re-requests the gpio (the kernel treats a double request as a
@@ -90,6 +91,8 @@ static void usage(FILE *out)
 "  disable_channels <gpio> [gpio ...]\n"
 "  not_really_enable <gpio>\n"
 "  not_really_disable <gpio>\n"
+"  tone <gpio> <notes> [--base=<hz>] [--prescale=<n>]\n"
+"                                  (notes: \"freq:ms ...\"; bare number = rest ms)\n"
 "  selftest [gpio] [--tone-hz=<f>] [--prescale=<n>] [--ms=<n>]\n"
 "  --selftest                       (same as: selftest pc12)\n"
 "\n"
@@ -311,6 +314,91 @@ static int cmd_not_really(int fd, const char *gpio, unsigned long req, const cha
 }
 
 /*
+ * Play a TONE NOTES sequence ("freq:ms freq:ms n" - a bare number is a rest
+ * of n ms; freq <= 0 disables the output for the note's duration). The
+ * grammar is byte-compatible with Forge-X's tone_player plugin so its
+ * NOTES string can be passed through verbatim, which lets the plugin swap
+ * its sysfs-PWMAudio backend for this tool without touching note parsing.
+ *
+ * One process plays the whole sequence in-process (no fork per note);
+ * duty is fixed 50%, the loudest drive for a piezo. The parent clock rate
+ * is assumed 50 MHz (stock parity) and can be overridden once the real
+ * rate is measured on a machine.
+ */
+static int cmd_tone(int fd, const char *gpio, const char *notes, long base, long prescale)
+{
+	struct pwm_config_args cfg;
+	struct pwm_ch_value v;
+	const char *p = notes;
+	uint32_t ch = (uint32_t)lookup_channel(gpio);
+	long clock = base / prescale;
+
+	if (clock <= 0)
+		die("error: base clock %ld / prescale %ld is not positive\n", base, prescale);
+
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.active_level = 1;
+	cfg.levels_exact = 0;
+	cfg.freq_hz = (uint32_t)base; /* stock parity: parent rate */
+	cfg.max_level = 300;
+	cfg.channel = ch;
+
+	pwm_request_gpio(fd, gpio);
+	xioctl(fd, PWM_IOC_CONFIG, &cfg, "pwm_config");
+
+	v.channel = ch;
+	v.value = (uint32_t)prescale;
+	xioctl(fd, PWM_IOC_SET_PRESCALE, &v, "pwm_set_prescale");
+
+	while (*p) {
+		char *end;
+		double freq = strtod(p, &end);
+		double ms = 0;
+
+		if (end == p)
+			die("error: cannot parse notes at: %s\n", p);
+		p = end;
+		if (*p == ':') {
+			p++;
+			ms = strtod(p, &end);
+			if (end == p)
+				die("error: cannot parse note duration at: %s\n", p);
+			p = end;
+		} else {
+			/* bare number: a rest of this many ms */
+			ms = freq;
+			freq = 0;
+		}
+		while (*p == ' ' || *p == '\t')
+			p++;
+
+		if (freq > 0) {
+			double total = (double)clock / freq;
+			long half = (long)(total / 2.0);
+
+			if (half < 1 || half > 0xffff)
+				die("error: frequency %.2f Hz does not fit the 16-bit halves "
+				    "(channel clock %ld Hz)\n", freq, clock);
+
+			v.value = PWM_WC(half, half);
+			xioctl(fd, PWM_IOC_SET_WC, &v, "pwm_set_wc");
+		} else {
+			v.value = PWM_WC(0, 0); /* stock silence idiom */
+			xioctl(fd, PWM_IOC_SET_WC, &v, "pwm_set_wc");
+		}
+
+		if (ms > 0)
+			usleep((useconds_t)(ms * 1000));
+	}
+
+	v.value = PWM_WC(0, 0);
+	xioctl(fd, PWM_IOC_SET_WC, &v, "pwm_set_wc");
+	if (ioctl(fd, PWM_IOC_RELEASE, (unsigned long)ch) < 0)
+		die("error: pwm_release failed: %s (see dmesg)\n", strerror(errno));
+	return 0;
+}
+
+/*
  * Bring-up aid for a human listening: stock-parity config, then two tones
  * whose period counts bracket the two plausible parent-clock rates (the
  * vendor driver defaults its rate global to 500 MHz before clk_get_rate;
@@ -450,6 +538,22 @@ int main(int argc, char **argv)
 		return cmd_not_really(fd, gpio, PWM_IOC_NOT_REALLY_ENABLE, "pwm_not_really_enable");
 	if (strcmp(verb, "not_really_disable") == 0)
 		return cmd_not_really(fd, gpio, PWM_IOC_NOT_REALLY_DISABLE, "pwm_not_really_disable");
+	if (strcmp(verb, "tone") == 0) {
+		long base = 50000000, prescale = 6;
+		int i;
+
+		if (argc < 4)
+			die("error: tone needs a notes string, e.g. \"1000:100 50 1479:200\"\n");
+		for (i = 4; i < argc; i++) {
+			if (strncmp(argv[i], "--base=", 7) == 0)
+				base = parse_long(argv[i] + 7, "base");
+			else if (strncmp(argv[i], "--prescale=", 11) == 0)
+				prescale = parse_long(argv[i] + 11, "prescale");
+			else
+				die("error: not support this arg: %s\n", argv[i]);
+		}
+		return cmd_tone(fd, gpio, argv[3], base, prescale);
+	}
 	if (strcmp(verb, "selftest") == 0)
 		return cmd_selftest(fd, argc - 2, argv + 2);
 
