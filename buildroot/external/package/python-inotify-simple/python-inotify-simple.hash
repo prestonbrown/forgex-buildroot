@@ -1,0 +1,4 @@
+# sha256 from https://pypi.org/pypi/inotify_simple/json
+sha256  8440ffe49c4ae81a8df57c1ae1eb4b6bfa7acb830099bfb3e305b383005cc128  inotify_simple-1.3.5.tar.gz
+# Locally computed sha256 checksum
+sha256  20fd17b8b0e786ae132dad3aa671f3a176cf2efb46eda4459ccf121510bc3811  LICENSE

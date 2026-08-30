@@ -1,0 +1,10 @@
+config BR2_PACKAGE_PYTHON_LIBNACL
+	bool "python-libnacl"
+	select BR2_PACKAGE_LIBSODIUM
+	help
+	  Python bindings for libsodium based on ctypes.
+
+	  The bindings are pure Python and dlopen() libsodium at
+	  runtime, so libsodium must be present on the target.
+
+	  https://github.com/saltstack/libnacl

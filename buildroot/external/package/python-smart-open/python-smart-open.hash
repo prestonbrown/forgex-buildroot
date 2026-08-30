@@ -1,0 +1,4 @@
+# sha256 from https://pypi.org/pypi/smart_open/json
+sha256  d3672003b1dbc85e2013e4983b88eb9a5ccfd389b0d4e5015f39a9ee5620ec18  smart_open-7.0.5.tar.gz
+# Locally computed sha256 checksum
+sha256  cbedcdbba694f5aad9e5f65875bcf7137bc7e6307e1d11a8d52bba9943d82f98  LICENSE

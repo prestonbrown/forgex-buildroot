@@ -1,0 +1,10 @@
+config BR2_PACKAGE_PYTHON_STREAMING_FORM_DATA
+	bool "python-streaming-form-data"
+	select BR2_PACKAGE_PYTHON_SMART_OPEN # runtime
+	help
+	  Streaming parser for multipart/form-data.
+
+	  The sdist ships the pre-generated _parser.c, so only a C
+	  compiler is needed, not Cython.
+
+	  https://github.com/siddhantgoel/streaming-form-data

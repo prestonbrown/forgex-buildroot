@@ -1,0 +1,25 @@
+Add the PEP 517 build-system table
+
+preprocess_cancellation 0.2.1 ships a poetry pyproject.toml that has no
+[build-system] table, and the sdist carries no setup.py or setup.cfg.
+PEP 517 front-ends therefore fall back to the legacy backend
+setuptools.build_meta:__legacy__, which does not fail loudly: it builds a
+wheel named preprocess_cancellation-0.0.0 with stub metadata and no
+console_scripts entry point.
+
+Declare the poetry-core backend the project actually uses, so the wheel
+carries the real version, metadata and entry point.
+
+Upstream added the table after this release; 0.2.1 is the version
+Moonraker v0.9.3 pins.
+
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -39,3 +39,7 @@
+ 
+ [tool.coverage.run]
+ branch = true
++
++[build-system]
++requires = ["poetry-core>=1.0.0"]
++build-backend = "poetry.core.masonry.api"

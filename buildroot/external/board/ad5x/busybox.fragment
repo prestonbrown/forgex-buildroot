@@ -1,0 +1,20 @@
+# Applets the Forge-X payload invokes inside the chroot.
+#
+#   httpd              .root/S70httpd:11   serves /root/www on :80
+#   ntpd               .root/S45ntpd:11    with the -S fake-hwclock hook
+#   start-stop-daemon  every .root/S* service script
+#   insmod/lsmod       .root/S35tslib:37   loads uinput.ko from inside the chroot
+#   mount              .root/S35tslib:41   mounts the vendor rootfs partition
+CONFIG_HTTPD=y
+CONFIG_FEATURE_HTTPD_BASIC_AUTH=y
+CONFIG_NTPD=y
+CONFIG_FEATURE_NTPD_SERVER=y
+CONFIG_START_STOP_DAEMON=y
+CONFIG_INSMOD=y
+CONFIG_LSMOD=y
+CONFIG_MODPROBE=y
+CONFIG_MOUNT=y
+CONFIG_FEATURE_MOUNT_LOOP=y
+CONFIG_UMOUNT=y
+# `date -d` parsing is load-bearing in .root/fake-hwclock:40-57
+CONFIG_FEATURE_DATE_ISOFMT=y

@@ -1,0 +1,4 @@
+# sha256 from https://pypi.org/pypi/libnacl/json
+sha256  f3418da7df29e6d9b11fd7d990289d16397dc1020e4e35192e11aee826922860  libnacl-2.1.0.tar.gz
+# Locally computed sha256 checksum
+sha256  125d859913f196c5e2c85bdf78050fcc3296855b1cb4e899d2f806bcec36553c  LICENSE

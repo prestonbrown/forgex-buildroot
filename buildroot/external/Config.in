@@ -1,0 +1,13 @@
+# Forge-X platform packages.
+#
+# A package belongs here only when upstream Buildroot has none. Anything
+# Buildroot already ships is selected from the defconfig instead, so this tree
+# stays small and tracks upstream rather than forking it.
+
+source "$BR2_EXTERNAL_FORGEX_PATH/package/python-importlib-metadata/Config.in"
+source "$BR2_EXTERNAL_FORGEX_PATH/package/python-inotify-simple/Config.in"
+source "$BR2_EXTERNAL_FORGEX_PATH/package/python-libnacl/Config.in"
+source "$BR2_EXTERNAL_FORGEX_PATH/package/python-preprocess-cancellation/Config.in"
+source "$BR2_EXTERNAL_FORGEX_PATH/package/python-smart-open/Config.in"
+source "$BR2_EXTERNAL_FORGEX_PATH/package/python-streaming-form-data/Config.in"
+source "$BR2_EXTERNAL_FORGEX_PATH/package/python-zipp/Config.in"

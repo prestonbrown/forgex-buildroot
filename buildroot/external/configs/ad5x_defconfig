@@ -1,0 +1,118 @@
+# FlashForge Adventurer 5X platform rootfs.
+#
+# Ingenic X2600 (XBurst II), MIPS32r5 little-endian, kernel 5.10.186.
+#
+# The ABI below is not a preference. The stock FlashForge userland and the
+# kernel that loads it fix every one of these, and a mismatch produces
+# binaries that link cleanly and then misbehave at runtime:
+#
+#   o32 ABI          e_flags on every stock binary; `libc ABIs: MIPS_O32_FP64`
+#   hard float FP64  Tag_GNU_MIPS_ABI_FP = 6, FPU FIR bit 22 set in hardware
+#   nan2008          every stock object; the loader is named for it
+#                    (/lib/ld-linux-mipsn8.so.1 -- the "n8" IS the NaN2008 marker)
+#
+# A default mipsel toolchain gets the last two wrong and names its loader
+# /lib/ld.so.1, which does not exist on this printer.
+BR2_mipsel=y
+BR2_mips_32r5=y
+# Buildroot defaults MIPS to soft-float (BR2_MIPS_SOFT_FLOAT, "default y"), and
+# BOTH settings below are `depends on !BR2_MIPS_SOFT_FLOAT`. Leave this line out
+# and they silently disappear from the config: you get a soft-float legacy-NaN
+# toolchain whose loader is named /lib/ld.so.1, and nothing warns you.
+# BR2_MIPS_SOFT_FLOAT is not set
+BR2_MIPS_FP32_MODE_64=y
+BR2_MIPS_ENABLE_NAN_2008=y
+
+# The stock rootfs is MIPS32r2, but ZMOD ships an r5 build that has run on
+# this exact SoC in the field, so r5 is proven rather than assumed. Nothing on
+# the printer uses MSA (0 of 630 objects surveyed), so it stays off.
+
+# Kernel is 5.10.186 and is never replaced -- headers must not exceed it.
+BR2_KERNEL_HEADERS_5_10=y
+BR2_TOOLCHAIN_BUILDROOT_GLIBC=y
+BR2_TOOLCHAIN_BUILDROOT_CXX=y
+
+# The chroot's hardcoded interpreter path /lib/ld-linux-mipsn8.so.1 only
+# resolves if /lib is a symlink into /usr/lib, which is what merged /usr does.
+BR2_ROOTFS_MERGED_USR=y
+
+BR2_TARGET_GENERIC_HOSTNAME="forge-x"
+BR2_TARGET_GENERIC_ISSUE="Forge-X"
+BR2_PACKAGE_BUSYBOX_SHOW_OTHERS=y
+BR2_SYSTEM_BIN_SH_BASH=y
+
+# This rootfs is entered with chroot(1) from the stock firmware; it never
+# boots. Buildroot's init scripts would fight the host's, so there is no init
+# system: .root/start.sh is the service layer.
+# BR2_INIT_BUSYBOX is not set
+BR2_INIT_NONE=y
+
+BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_FORGEX_PATH)/board/ad5x/busybox.fragment"
+
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_FORGEX_PATH)/board/ad5x/post-build.sh"
+
+# ---------------------------------------------------------------------------
+# Runtime: what the Forge-X payload calls inside the chroot
+# ---------------------------------------------------------------------------
+# git      .shell/S00init:106-108, and Moonraker's git_repo updater, over HTTPS
+# sqlite3  .root/restore_ota.sh:20-55 pipes SQL into the CLI
+# curl     .root/start.sh:40 (health poll) and .root/forge-x:53 (GitHub, TLS)
+BR2_PACKAGE_GIT=y
+BR2_PACKAGE_SQLITE=y
+BR2_PACKAGE_LIBCURL=y
+BR2_PACKAGE_LIBCURL_CURL=y
+BR2_PACKAGE_OPENSSL=y
+BR2_PACKAGE_CA_CERTIFICATES=y
+# Moonraker enumerates interfaces with `ip -json -det address`
+# (machine.py:674). BusyBox's ip applet has no JSON output, so this needs the
+# real iproute2 -- without it every network update raises ShellCommandError and
+# clients show no network information.
+BR2_PACKAGE_IPROUTE2=y
+
+# ---------------------------------------------------------------------------
+# Python 3.12 and Moonraker's dependency set
+# ---------------------------------------------------------------------------
+# Pinned to what Forge-X's vendored Moonraker (upstream v0.9.3, .root/moonraker/)
+# actually imports. Note dbus-next, NOT dbus-fast: the switch happened after
+# v0.9.3.
+BR2_PACKAGE_PYTHON3=y
+BR2_PACKAGE_PYTHON3_SSL=y
+BR2_PACKAGE_PYTHON3_SQLITE=y
+BR2_PACKAGE_PYTHON3_PYEXPAT=y
+BR2_PACKAGE_PYTHON3_ZLIB=y
+BR2_PACKAGE_PYTHON3_XZ=y
+BR2_PACKAGE_PYTHON3_DECIMAL=y
+BR2_PACKAGE_PYTHON3_UNICODEDATA=y
+# Ship bytecode only. ZMOD does the same on this platform, so it is proven
+# against this dependency set rather than merely plausible.
+BR2_PACKAGE_PYTHON3_PYC_ONLY=y
+
+BR2_PACKAGE_PYTHON_TORNADO=y
+BR2_PACKAGE_PYTHON_PILLOW=y
+BR2_PACKAGE_PYTHON_DISTRO=y
+BR2_PACKAGE_PYTHON_JINJA2=y
+BR2_PACKAGE_PYTHON_DBUS_NEXT=y
+BR2_PACKAGE_PYTHON_PERIPHERY=y
+BR2_PACKAGE_PYTHON_PAHO_MQTT=y
+BR2_PACKAGE_PYTHON_ZEROCONF=y
+BR2_PACKAGE_PYTHON_SERIAL=y
+
+# Not in upstream Buildroot; recipes live in this external tree.
+BR2_PACKAGE_PYTHON_LIBNACL=y
+BR2_PACKAGE_PYTHON_IMPORTLIB_METADATA=y
+BR2_PACKAGE_PYTHON_ZIPP=y
+BR2_PACKAGE_PYTHON_INOTIFY_SIMPLE=y
+BR2_PACKAGE_PYTHON_SMART_OPEN=y
+BR2_PACKAGE_PYTHON_STREAMING_FORM_DATA=y
+BR2_PACKAGE_PYTHON_PREPROCESS_CANCELLATION=y
+
+# Deliberately NOT enabled: apprise (push notifications, ~10 MB with its
+# transitive set) and ldap3 (LDAP auth). Both are config-gated components that
+# Moonraker only loads when the matching section exists, and neither default
+# Forge-X config has one. Revisit if a user asks.
+
+# We ship a tarball that the installer unpacks into $MOD on the printer.
+# No filesystem image, no kernel, no bootloader -- all three come from stock.
+BR2_TARGET_ROOTFS_TAR=y
+BR2_TARGET_ROOTFS_TAR_XZ=y
+# BR2_TARGET_ROOTFS_EXT2 is not set

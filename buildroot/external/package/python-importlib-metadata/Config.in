@@ -1,0 +1,7 @@
+config BR2_PACKAGE_PYTHON_IMPORTLIB_METADATA
+	bool "python-importlib-metadata"
+	select BR2_PACKAGE_PYTHON_ZIPP # runtime
+	help
+	  Library to access the metadata for a Python package.
+
+	  https://github.com/python/importlib_metadata

@@ -1,0 +1,7 @@
+config BR2_PACKAGE_PYTHON_INOTIFY_SIMPLE
+	bool "python-inotify-simple"
+	help
+	  A simple Python wrapper around inotify. No fancy bells and
+	  whistles, just a literal wrapper with ctypes.
+
+	  https://github.com/chrisjbillington/inotify_simple

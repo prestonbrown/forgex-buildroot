@@ -1,0 +1,6 @@
+config BR2_PACKAGE_PYTHON_PREPROCESS_CANCELLATION
+	bool "python-preprocess-cancellation"
+	help
+	  GCode processor that adds Klipper cancel-object markers.
+
+	  https://github.com/kageurufu/cancelobject-preprocessor
