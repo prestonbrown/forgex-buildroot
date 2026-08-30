@@ -20,7 +20,8 @@ buildroot/
     external.desc   the BR2_EXTERNAL tree declaration
     configs/        ad5x_defconfig - the target; carries the ABI pins
     board/ad5x/     busybox.fragment, post-build.sh
-    package/        Moonraker's python dependencies as buildroot packages
+    package/        fx-pwm (AD5X buzzer via the stock soc_pwm.ko ioctl ABI)
+                    and Moonraker's python dependencies as buildroot packages
 ```
 
 ## Building

@@ -4,6 +4,7 @@
 # Buildroot already ships is selected from the defconfig instead, so this tree
 # stays small and tracks upstream rather than forking it.
 
+source "$BR2_EXTERNAL_FORGEX_PATH/package/fx-pwm/Config.in"
 source "$BR2_EXTERNAL_FORGEX_PATH/package/python-importlib-metadata/Config.in"
 source "$BR2_EXTERNAL_FORGEX_PATH/package/python-inotify-simple/Config.in"
 source "$BR2_EXTERNAL_FORGEX_PATH/package/python-libnacl/Config.in"

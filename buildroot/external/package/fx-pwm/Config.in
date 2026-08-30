@@ -1,0 +1,10 @@
+config BR2_PACKAGE_FX_PWM
+	bool "fx-pwm"
+	help
+	  Userspace driver for the Ingenic X2600 PWM2 block (the AD5X piezo
+	  buzzer on pc12) through the ioctl ABI of the stock soc_pwm.ko
+	  kernel module (/dev/jz_pwm).
+
+	  The stock firmware beeps by calling its own cmd_pwm tool from the
+	  OEM rootfs, which the Forge-X chroot replaces - this package ships
+	  the replacement so the buzzer keeps working inside the chroot.

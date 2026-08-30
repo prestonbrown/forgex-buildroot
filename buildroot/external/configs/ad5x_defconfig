@@ -111,6 +111,11 @@ BR2_PACKAGE_PYTHON_PREPROCESS_CANCELLATION=y
 # Moonraker only loads when the matching section exists, and neither default
 # Forge-X config has one. Revisit if a user asks.
 
+# The stock firmware beeps by calling cmd_pwm from the OEM rootfs this tree
+# replaces; fx-pwm is our client of the stock soc_pwm.ko driver (/dev/jz_pwm)
+# so the AD5X buzzer (pc12) keeps working inside the chroot.
+BR2_PACKAGE_FX_PWM=y
+
 # We ship a tarball that the installer unpacks into $MOD on the printer.
 # No filesystem image, no kernel, no bootloader -- all three come from stock.
 BR2_TARGET_ROOTFS_TAR=y
