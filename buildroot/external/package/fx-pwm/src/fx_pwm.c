@@ -67,8 +67,11 @@ static int g_watchdog_seconds = 5;
 /*
  * One fx-pwm on the channel at a time. Concurrent invocations interleave
  * ioctls on one channel and the driver wedges (measured: four D-state
- * children in one incident). A blocking flock serializes every spawner
- * - helixscreen's sound backend, klippy's tone_player, macros, humans.
+ * children in one incident). The lock is NON-BLOCKING on purpose: a
+ * caller that finds the channel busy exits silently, so a burst of
+ * sounds drops its overlap instead of queueing children that play late,
+ * one after another, long after the burst. Every spawner gets this -
+ * helixscreen's sound backend, klippy's tone_player, macros, humans.
  */
 static void acquire_instance_lock(void)
 {
@@ -76,7 +79,8 @@ static void acquire_instance_lock(void)
 
 	if (fd < 0)
 		return; /* best effort: proceed unlocked */
-	flock(fd, LOCK_EX);
+	if (flock(fd, LOCK_EX | LOCK_NB) < 0)
+		_exit(0); /* channel busy: this sound is dropped */
 	/* leak the fd deliberately: process exit releases the lock */
 }
 
