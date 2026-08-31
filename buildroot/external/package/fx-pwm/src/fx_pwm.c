@@ -126,8 +126,15 @@ static const char *g_gpio_name;
 
 static void release_and_exit(int sig)
 {
-	if (g_fd >= 0 && g_channel >= 0)
-		ioctl(g_fd, ioc_RELEASE(PWM_IOC_RELEASE), (unsigned long)g_channel);
+	/*
+	 * NO ioctl from the handler: releasing from a signal that interrupted
+	 * an in-flight ioctl D-wedged a child on the rig, and a wedged child
+	 * holding the instance flock silences every later sound. Orphaning
+	 * the claim is recoverable - the next invocation's release-first
+	 * request cycle picks the channel back up (measured all night).
+	 */
+	(void)g_fd;
+	(void)g_channel;
 	_exit(128 + sig);
 }
 
