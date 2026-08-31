@@ -54,6 +54,8 @@
 #include <unistd.h>
 
 #include <sys/ioctl.h>
+#include <sys/file.h>
+#include <sys/mman.h>
 
 #include "pwm_abi.h"
 
@@ -61,6 +63,22 @@
 #define PWM_DEVICE_ALT  "/dev/misc/jz_pwm"
 
 static int g_watchdog_seconds = 5;
+
+/*
+ * One fx-pwm on the channel at a time. Concurrent invocations interleave
+ * ioctls on one channel and the driver wedges (measured: four D-state
+ * children in one incident). A blocking flock serializes every spawner
+ * - helixscreen's sound backend, klippy's tone_player, macros, humans.
+ */
+static void acquire_instance_lock(void)
+{
+	int fd = open("/tmp/fx-pwm.lock", O_CREAT | O_RDWR, 0644);
+
+	if (fd < 0)
+		return; /* best effort: proceed unlocked */
+	flock(fd, LOCK_EX);
+	/* leak the fd deliberately: process exit releases the lock */
+}
 
 /*
  * Ioctl numbers, overridable via FX_PWM_IOC_<NAME> for bring-up on OEM
@@ -544,6 +562,27 @@ static void dma_renote(int fd, int ch, long half)
 
 static void dma_silence(int fd, int ch)
 {
+	/*
+	 * The driver's disable ioctl wedges nondeterministically after
+	 * loops - measured repeatedly on the rig, recovery is a reboot.
+	 * The channel-disable REGISTER write never wedges (it is the poke
+	 * that recovered every wedge tonight): bit <ch> of the disable
+	 * register at PWM2 base + 0x04. Fall back to the ioctl only when
+	 * /dev/mem is unavailable.
+	 */
+	int mem = open("/dev/mem", O_RDWR | O_SYNC);
+
+	if (mem >= 0) {
+		void *p = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
+			       MAP_SHARED, mem, 0x13610000);
+		if (p != MAP_FAILED) {
+			*(volatile uint32_t *)((char *)p + 0x04) = (1u << ch);
+			munmap(p, 0x1000);
+			close(mem);
+			return;
+		}
+		close(mem);
+	}
 	if (ioctl(fd, ioc_DMA_DISABLE_LOOP(PWM_IOC_DMA_DISABLE_LOOP),
 		  (unsigned long)ch) < 0)
 		die("failed: pwm_dma_disable_loop (%s)\n", strerror(errno));
@@ -1030,6 +1069,8 @@ int main(int argc, char **argv)
 		usage(stderr);
 		return 1;
 	}
+
+	acquire_instance_lock();
 
 	/* Global options may appear anywhere; strip them before dispatch. */
 	for (i = 1; i < argc; i++) {
