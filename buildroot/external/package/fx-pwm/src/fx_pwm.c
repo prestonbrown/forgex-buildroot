@@ -488,6 +488,13 @@ static int cmd_probe(int fd, const char *gpio)
 #define DMA_LOOP_WORDS 4
 
 /*
+ * Loop length for DMA tones. The driver requires a multiple of 4 words;
+ * 4 identical period-words is the shortest legal loop and repeats fast
+ * enough that the output is a continuous tone.
+ */
+#define DMA_LOOP_WORDS 4
+
+/*
  * Push one period word `count` times and start the loop. Same 16-bit
  * halves as set_wc; the DMA engine replays them continuously until
  * disabled, with none of set_wc's one-shot update-engine wedging.
@@ -509,6 +516,30 @@ static void dma_note(int fd, int ch, long half)
 	xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op, "pwm_dma_update");
 	op.op = 1; /* loop it */
 	xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op, "pwm_dma_enable_loop");
+}
+
+/*
+ * Swap the loop's waveform without disabling the channel. Measured on the
+ * rig: with a disable/enable pair around every note, only the first and
+ * last notes of a sequence are audible (the enable-after-disable middle
+ * notes come back driver-ok but silent). Rests in legato mode are a
+ * minimum-length period - far above hearing - rather than a stop.
+ */
+static void dma_renote(int fd, int ch, long half)
+{
+	struct pwm_dma_op_args op;
+	uint32_t words[DMA_LOOP_WORDS];
+	int i;
+
+	for (i = 0; i < DMA_LOOP_WORDS; i++)
+		words[i] = PWM_WC(half, half);
+
+	memset(&op, 0, sizeof(op));
+	op.channel = (uint32_t)ch;
+	op.count = DMA_LOOP_WORDS;
+	op.data = (uint32_t)(uintptr_t)words;
+	op.op = 0; /* swap the buffer under the running loop */
+	xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op, "pwm_dma_update");
 }
 
 static void dma_silence(int fd, int ch)
@@ -668,6 +699,130 @@ static int cmd_tone(int fd, const char *gpio, const char *notes,
 	}
 	/* DMA mode needs no trailing stop: every note's disable already ran,
 	 * and a further disable_loop is refused with "dma is not loop". */
+	g_channel = -1; /* the release below is the clean one */
+	pwm_release_channel(fd, ch, gpio);
+	return 0;
+}
+
+/*
+ * Class-D bring-up probe: one large buffer of period words at a FIXED
+ * carrier, each word's duty encoding one sample of a triangle wave. If
+ * the engine walks the whole buffer each loop, the piezo reproduces the
+ * encoded tone through its own resonance; if it only replays the first
+ * word, the carrier alone (or nothing) sounds. Tuner-readable either way:
+ * reading the encoded tone means duty-modulated sample streaming works,
+ * which is the foundation for real audio synthesis on this transducer.
+ */
+#define SINE_BUF_WORDS 4096
+
+static int cmd_sine(int fd, const char *gpio, double freq, double ms,
+		    double carrier, long base, long prescale, double swap)
+{
+	struct pwm_config_args cfg;
+	struct pwm_ch_value v;
+	struct pwm_dma_init_args di;
+	struct pwm_dma_op_args op;
+	static uint32_t words[SINE_BUF_WORDS];
+	long clock = base / prescale;
+	long period, half, c_total, c_half;
+	int ch;
+	long i;
+
+	if (clock <= 0)
+		die("error: base clock %ld / prescale %ld is not positive\n",
+		    base, prescale);
+	period = (long)((double)clock / carrier);
+	if (period < 2 || period > 131070)
+		die("error: carrier %.0f Hz does not fit one word "
+		    "(channel clock %ld Hz)\n", carrier, clock);
+	half = period / 2;
+	/* integer phase: track freq*1000 modulo carrier*1000 */
+	c_total = (long)(carrier * 1000.0);
+	c_half = c_total / 2;
+
+	for (i = 0; i < SINE_BUF_WORDS; i++) {
+		long pos = (long)((unsigned long long)(freq * 1000.0) * i) % c_total;
+		long tri, hi;
+
+		if (pos < c_half)
+			tri = -1000 + 2000 * pos / c_half;
+		else
+			tri = 1000 - 2000 * (pos - c_half) / c_half;
+		/* +/-40% duty swing around 50% */
+		hi = half + tri * (period * 2 / 5) / 1000;
+		if (hi < 1)
+			hi = 1;
+		if (hi > period - 1)
+			hi = period - 1;
+		words[i] = PWM_WC(period - hi, hi);
+	}
+
+	alarm((unsigned)(ms / 1000.0) + 3);
+
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.active_level = 1;
+	cfg.levels_exact = 0;
+	cfg.freq_hz = 1000000; /* conservative: see cmd_tone */
+	cfg.max_level = 300;
+
+	ch = pwm_request_channel(fd, gpio);
+	pwm_release_channel(fd, ch, gpio);
+	ch = pwm_request_channel(fd, gpio);
+	arm_signal_release(fd, ch, gpio);
+
+	cfg.channel = (uint32_t)ch;
+	xioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg, "pwm_config");
+
+	v.channel = (uint32_t)ch;
+	v.value = (uint32_t)prescale;
+	xioctl(fd, ioc_SET_PRESCALE(PWM_IOC_SET_PRESCALE), &v, "pwm_set_prescale");
+
+	memset(&di, 0, sizeof(di));
+	di.channel = (uint32_t)ch;
+	di.active_level = 1;
+	di.loop = 1;
+	xioctl(fd, ioc_DMA_INIT(PWM_IOC_DMA_INIT), &di, "pwm_dma_init");
+
+	memset(&op, 0, sizeof(op));
+	op.channel = (uint32_t)ch;
+	op.count = SINE_BUF_WORDS;
+	op.data = (uint32_t)(uintptr_t)words;
+	op.op = 0;
+	xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op, "pwm_dma_update");
+	op.op = 1;
+	xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op, "pwm_dma_enable_loop");
+	printf("sine %.0f Hz, %.0f Hz carrier (%ld counts/cycle), %d words "
+	       "(%.0f ms), %.0f ms\n", freq, carrier, period, SINE_BUF_WORDS,
+	       SINE_BUF_WORDS * 1000.0 / carrier, ms);
+	fflush(stdout);
+	if (swap > 0) {
+		usleep((useconds_t)(ms * 500.0));
+		/* swap the running loop's buffer: one op-0 copy, no
+		 * disable/enable around it - the streaming primitive */
+		for (i = 0; i < SINE_BUF_WORDS; i++) {
+			long pos = (long)((unsigned long long)(swap * 1000.0) * i) % c_total;
+			long tri, hi;
+
+			if (pos < c_half)
+				tri = -1000 + 2000 * pos / c_half;
+			else
+				tri = 1000 - 2000 * (pos - c_half) / c_half;
+			hi = half + tri * (period * 2 / 5) / 1000;
+			if (hi < 1)
+				hi = 1;
+			if (hi > period - 1)
+				hi = period - 1;
+			words[i] = PWM_WC(period - hi, hi);
+		}
+		op.op = 0;
+		xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op, "pwm_dma_update");
+		printf("swapped to %.0f Hz under the running loop\n", swap);
+		fflush(stdout);
+		usleep((useconds_t)(ms * 500.0));
+	} else {
+		usleep((useconds_t)(ms * 1000));
+	}
+	dma_silence(fd, ch);
 	g_channel = -1; /* the release below is the clean one */
 	pwm_release_channel(fd, ch, gpio);
 	return 0;
@@ -865,6 +1020,28 @@ int main(int argc, char **argv)
 				die("error: not support this arg: %s\n", argv[i]);
 		}
 		return cmd_tone(fd, gpio, argv[3], base, prescale, backend);
+	}
+	if (strcmp(verb, "sine") == 0) {
+		double freq = 440.0, ms = 1500.0, carrier = 32000.0, swap = 0.0;
+		long base = 50000000, prescale = 6;
+
+		for (i = 4; i < argc; i++) {
+			if (strncmp(argv[i], "--freq=", 7) == 0)
+				freq = strtod(argv[i] + 7, NULL);
+			else if (strncmp(argv[i], "--carrier=", 10) == 0)
+				carrier = strtod(argv[i] + 10, NULL);
+			else if (strncmp(argv[i], "--ms=", 5) == 0)
+				ms = strtod(argv[i] + 5, NULL);
+			else if (strncmp(argv[i], "--swap=", 7) == 0)
+				swap = strtod(argv[i] + 7, NULL);
+			else if (strncmp(argv[i], "--base=", 7) == 0)
+				base = parse_long(argv[i] + 7, "base");
+			else if (strncmp(argv[i], "--prescale=", 11) == 0)
+				prescale = parse_long(argv[i] + 11, "prescale");
+			else if (strncmp(argv[i], "--", 2) != 0)
+				die("error: not support this arg: %s\n", argv[i]);
+		}
+		return cmd_sine(fd, gpio, freq, ms, carrier, base, prescale, swap);
 	}
 	if (strcmp(verb, "probe") == 0)
 		return cmd_probe(fd, gpio);
