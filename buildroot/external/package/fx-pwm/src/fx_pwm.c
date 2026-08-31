@@ -63,6 +63,29 @@
 static int g_watchdog_seconds = 5;
 
 /*
+ * Ioctl numbers, overridable via FX_PWM_IOC_<NAME> for bring-up on OEM
+ * builds whose soc_pwm encodings differ from the Factory 1.1.7 reference
+ * (see pwm_abi.h). Overrides must come from decoding that machine's own
+ * libhardware2.so, never from guessing.
+ */
+#define IOC_OVERRIDE(name, value) \
+	static unsigned long ioc_##name(unsigned long fallback) { \
+		const char *s = getenv("FX_PWM_IOC_" #name); \
+		return (s && *s) ? strtoul(s, NULL, 0) : (fallback); \
+	}
+IOC_OVERRIDE(REQUEST, PWM_IOC_REQUEST)
+IOC_OVERRIDE(RELEASE, PWM_IOC_RELEASE)
+IOC_OVERRIDE(CONFIG, PWM_IOC_CONFIG)
+IOC_OVERRIDE(SET_WC, PWM_IOC_SET_WC)
+IOC_OVERRIDE(SET_PRESCALE, PWM_IOC_SET_PRESCALE)
+IOC_OVERRIDE(SET_LEVEL, PWM_IOC_SET_LEVEL)
+IOC_OVERRIDE(GET_LEVEL, PWM_IOC_GET_LEVEL)
+IOC_OVERRIDE(ENABLE_CHANNELS, PWM_IOC_ENABLE_CHANNELS)
+IOC_OVERRIDE(DISABLE_CHANNELS, PWM_IOC_DISABLE_CHANNELS)
+IOC_OVERRIDE(NOT_REALLY_ENABLE, PWM_IOC_NOT_REALLY_ENABLE)
+IOC_OVERRIDE(NOT_REALLY_DISABLE, PWM_IOC_NOT_REALLY_DISABLE)
+
+/*
  * gpio allowlist. The kernel driver's own table (pwm_gpio_array, decoded
  * from the vendor module) maps, with gpio ids encoded (port<<5)|pin:
  *
@@ -210,7 +233,7 @@ static int pwm_request_channel(int fd, const char *gpio)
 
 	to_lowercase(name, sizeof(name), gpio);
 	step("request %s ... ", name);
-	ch = ioctl(fd, PWM_IOC_REQUEST, name);
+	ch = ioctl(fd, ioc_REQUEST(PWM_IOC_REQUEST), name);
 	if (ch < 0) {
 		int saved = errno;
 
@@ -237,7 +260,7 @@ static void xioctl(int fd, unsigned long req, void *arg, const char *what)
 static void pwm_release_channel(int fd, int ch, const char *gpio)
 {
 	step("release %s (ch%d) ... ", gpio, ch);
-	if (ioctl(fd, PWM_IOC_RELEASE, (unsigned long)ch) < 0)
+	if (ioctl(fd, ioc_RELEASE(PWM_IOC_RELEASE), (unsigned long)ch) < 0)
 		die("failed: %s\n", strerror(errno));
 	step("ok\n");
 }
@@ -288,7 +311,7 @@ static int cmd_config(int fd, const char *gpio, int argc, char **argv)
 
 	ch = pwm_request_channel(fd, gpio);
 	cfg.channel = (uint32_t)ch;
-	xioctl(fd, PWM_IOC_CONFIG, &cfg, "pwm_config");
+	xioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg, "pwm_config");
 	printf("configured %s (ch%d): freq=%u max_level=%u active_level=%u accuracy_priority=%s\n",
 	       gpio, ch, cfg.freq_hz, cfg.max_level, cfg.active_level, accuracy);
 	return 0;
@@ -301,7 +324,7 @@ static int cmd_set_level(int fd, const char *gpio, const char *level_s)
 	v.channel = (uint32_t)pwm_request_channel(fd, gpio);
 	v.value = (uint32_t)parse_long(level_s, "level");
 
-	xioctl(fd, PWM_IOC_SET_LEVEL, &v, "pwm_set_level");
+	xioctl(fd, ioc_SET_LEVEL(PWM_IOC_SET_LEVEL), &v, "pwm_set_level");
 	printf("%s level %u\n", gpio, v.value);
 	return 0;
 }
@@ -313,7 +336,7 @@ static int cmd_get_level(int fd, const char *gpio)
 	io.channel = (uint32_t)pwm_request_channel(fd, gpio);
 	io.level = 0;
 
-	xioctl(fd, PWM_IOC_GET_LEVEL, &io, "pwm_get_level");
+	xioctl(fd, ioc_GET_LEVEL(PWM_IOC_GET_LEVEL), &io, "pwm_get_level");
 	printf("%s (ch%u) level %u\n", gpio, io.channel, io.level);
 	return 0;
 }
@@ -330,7 +353,7 @@ static int cmd_set_wc(int fd, const char *gpio, const char *high_s, const char *
 	v.channel = (uint32_t)pwm_request_channel(fd, gpio);
 	v.value = PWM_WC(high, low);
 
-	xioctl(fd, PWM_IOC_SET_WC, &v, "pwm_set_wc");
+	xioctl(fd, ioc_SET_WC(PWM_IOC_SET_WC), &v, "pwm_set_wc");
 	printf("%s duty: active %d counts, inactive %d counts\n", gpio, low, high);
 	return 0;
 }
@@ -344,7 +367,7 @@ static int cmd_set_prescale(int fd, const char *gpio, const char *div_s)
 	if (v.value == 0 || v.value >= 0x10000)
 		die("error: prescale must be 1..65535 (channel clock = parent / prescale)\n");
 
-	xioctl(fd, PWM_IOC_SET_PRESCALE, &v, "pwm_set_prescale");
+	xioctl(fd, ioc_SET_PRESCALE(PWM_IOC_SET_PRESCALE), &v, "pwm_set_prescale");
 	printf("%s channel clock = parent / %u\n", gpio, v.value);
 	return 0;
 }
@@ -355,7 +378,7 @@ static int cmd_disable(int fd, const char *gpio)
 
 	/* RELEASE passes the channel BY VALUE - see pwm_abi.h. */
 	step("pwm_release ... ");
-	if (ioctl(fd, PWM_IOC_RELEASE, (unsigned long)ch) < 0)
+	if (ioctl(fd, ioc_RELEASE(PWM_IOC_RELEASE), (unsigned long)ch) < 0)
 		die("failed: %s (see dmesg)\n", strerror(errno));
 	step("ok\n");
 	printf("%s disabled\n", gpio);
@@ -396,7 +419,7 @@ static int cmd_probe(int fd, const char *gpio)
 	int ch = pwm_request_channel(fd, gpio);
 
 	level = (uint32_t)ch;
-	if (ioctl(fd, PWM_IOC_GET_LEVEL, &level) == 0)
+	if (ioctl(fd, ioc_GET_LEVEL(PWM_IOC_GET_LEVEL), &level) == 0)
 		printf("%s -> kernel channel %d, current level %u\n", gpio, ch, level);
 	else
 		printf("%s -> kernel channel %d (get_level: %s)\n", gpio, ch, strerror(errno));
@@ -442,11 +465,11 @@ static int cmd_tone(int fd, const char *gpio, const char *notes, long base, long
 
 	ch = pwm_request_channel(fd, gpio);
 	cfg.channel = (uint32_t)ch;
-	xioctl(fd, PWM_IOC_CONFIG, &cfg, "pwm_config");
+	xioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg, "pwm_config");
 
 	v.channel = (uint32_t)ch;
 	v.value = (uint32_t)prescale;
-	xioctl(fd, PWM_IOC_SET_PRESCALE, &v, "pwm_set_prescale");
+	xioctl(fd, ioc_SET_PRESCALE(PWM_IOC_SET_PRESCALE), &v, "pwm_set_prescale");
 
 	while (*p) {
 		char *end;
@@ -479,10 +502,10 @@ static int cmd_tone(int fd, const char *gpio, const char *notes, long base, long
 				    "(channel clock %ld Hz)\n", freq, clock);
 
 			v.value = PWM_WC(half, half);
-			xioctl(fd, PWM_IOC_SET_WC, &v, "pwm_set_wc");
+			xioctl(fd, ioc_SET_WC(PWM_IOC_SET_WC), &v, "pwm_set_wc");
 		} else {
 			v.value = PWM_WC(0, 0); /* stock silence idiom */
-			xioctl(fd, PWM_IOC_SET_WC, &v, "pwm_set_wc");
+			xioctl(fd, ioc_SET_WC(PWM_IOC_SET_WC), &v, "pwm_set_wc");
 		}
 
 		if (ms > 0)
@@ -490,7 +513,7 @@ static int cmd_tone(int fd, const char *gpio, const char *notes, long base, long
 	}
 
 	v.value = PWM_WC(0, 0);
-	xioctl(fd, PWM_IOC_SET_WC, &v, "pwm_set_wc");
+	xioctl(fd, ioc_SET_WC(PWM_IOC_SET_WC), &v, "pwm_set_wc");
 	pwm_release_channel(fd, ch, gpio);
 	return 0;
 }
@@ -539,11 +562,11 @@ static int cmd_selftest(int fd, int argc, char **argv)
 	printf("selftest on %s: config (max_level 300) ...\n", gpio);
 	ch = pwm_request_channel(fd, gpio);
 	cfg.channel = (uint32_t)ch;
-	xioctl(fd, PWM_IOC_CONFIG, &cfg, "pwm_config");
+	xioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg, "pwm_config");
 
 	v.channel = (uint32_t)ch;
 	v.value = (uint32_t)prescale;
-	xioctl(fd, PWM_IOC_SET_PRESCALE, &v, "pwm_set_prescale");
+	xioctl(fd, ioc_SET_PRESCALE(PWM_IOC_SET_PRESCALE), &v, "pwm_set_prescale");
 	printf("prescale %ld -> channel clock = parent / %ld\n", prescale, prescale);
 
 	for (t = 0; t < sizeof(tones) / sizeof(tones[0]); t++) {
@@ -564,11 +587,11 @@ static int cmd_selftest(int fd, int argc, char **argv)
 		printf("tone %u: %ld counts total (%s), %ld ms...\n",
 		       (unsigned)(t + 1), total, note, ms);
 		fflush(stdout);
-		xioctl(fd, PWM_IOC_SET_WC, &v, "pwm_set_wc");
+		xioctl(fd, ioc_SET_WC(PWM_IOC_SET_WC), &v, "pwm_set_wc");
 		usleep((useconds_t)ms * 1000);
 
 		v.value = PWM_WC(0, 0); /* stock silence idiom */
-		xioctl(fd, PWM_IOC_SET_WC, &v, "pwm_set_wc");
+		xioctl(fd, ioc_SET_WC(PWM_IOC_SET_WC), &v, "pwm_set_wc");
 		usleep(150000);
 	}
 
@@ -659,13 +682,13 @@ int main(int argc, char **argv)
 	if (strcmp(verb, "disable") == 0)
 		return cmd_disable(fd, gpio);
 	if (strcmp(verb, "enable_channels") == 0)
-		return cmd_channels(fd, argc - 2, argv + 2, PWM_IOC_ENABLE_CHANNELS, "pwm_enable_channels");
+		return cmd_channels(fd, argc - 2, argv + 2, ioc_ENABLE_CHANNELS(PWM_IOC_ENABLE_CHANNELS), "pwm_enable_channels");
 	if (strcmp(verb, "disable_channels") == 0)
-		return cmd_channels(fd, argc - 2, argv + 2, PWM_IOC_DISABLE_CHANNELS, "pwm_disable_channels");
+		return cmd_channels(fd, argc - 2, argv + 2, ioc_DISABLE_CHANNELS(PWM_IOC_DISABLE_CHANNELS), "pwm_disable_channels");
 	if (strcmp(verb, "not_really_enable") == 0)
-		return cmd_not_really(fd, gpio, PWM_IOC_NOT_REALLY_ENABLE, "pwm_not_really_enable");
+		return cmd_not_really(fd, gpio, ioc_NOT_REALLY_ENABLE(PWM_IOC_NOT_REALLY_ENABLE), "pwm_not_really_enable");
 	if (strcmp(verb, "not_really_disable") == 0)
-		return cmd_not_really(fd, gpio, PWM_IOC_NOT_REALLY_DISABLE, "pwm_not_really_disable");
+		return cmd_not_really(fd, gpio, ioc_NOT_REALLY_DISABLE(PWM_IOC_NOT_REALLY_DISABLE), "pwm_not_really_disable");
 	if (strcmp(verb, "tone") == 0) {
 		long base = 50000000, prescale = 6;
 

@@ -123,4 +123,15 @@ struct pwm_ch_value {
  */
 #define PWM_WC(high, low) ((((high) & 0xffff) << 16) | ((low) & 0xffff))
 
+/*
+ * Bring-up aid: the numbers above were decoded from the Factory 1.1.7
+ * bundle. A printer running an older OEM build can carry a soc_pwm that
+ * differs in some command encodings (observed on the AD5X rig: REQUEST
+ * and GET_LEVEL match across builds, CONFIG does not - silent -EPERM).
+ * Any number can be overridden per-run through the environment, e.g.
+ * FX_PWM_IOC_CONFIG=0x40185001 fx-pwm config pc12 ... - values should
+ * come from decoding that machine's own libhardware2.so pwm_config call
+ * site, not from guessing.
+ */
+
 #endif /* FX_PWM_ABI_H */

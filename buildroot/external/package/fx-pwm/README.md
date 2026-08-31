@@ -31,6 +31,43 @@ Run `fx-pwm --help` for the full verb list (`config`, `set_level`,
 `selftest` plays two tones bracketing the plausible parent-clock rates and
 then releases the channel - it exists for bring-up with a human listening.
 
+## The stock working sequence (from firmwareExe's own disassembly)
+
+firmwareExe's buzzer thread (buzzer.cpp, symbols intact in the factory
+binary) does sprintf + system() into the STOCK cmd_pwm on the stock
+rootfs - the boot chirp is literally `system("cmd_pwm ...")`. The exact
+sequence:
+
+    one-time (buzzerPlay ctor):
+        cmd_pwm config <gpio> freq=50000000 max_level=300 active_level=1 accuracy_priority=freq
+        cmd_pwm set_level <gpio> 100
+        cmd_pwm set_prescale <gpio> 6
+    per tune (thread):
+        cmd_pwm enable_channels <gpio>
+        cmd_pwm set_wc <gpio> <high> <low>
+        cmd_pwm set_wc <gpio> 0 0        (silence)
+        cmd_pwm disable_channels <gpio>
+
+Note set_level BEFORE set_prescale in the ctor, and enable_channels
+wrapping each tune. The rig's parent clock measures 384 MHz.
+
+## OEM-build ioctl drift and the FX_PWM_IOC_* overrides
+
+The rig's running soc_pwm is evidently NOT the Factory 1.1.7 build (its
+kallsyms function order differs from the 1.1.7 file's - pwm2_request
+sits below pwm_open), and its CONFIG command encoding apparently differs
+while REQUEST and GET_LEVEL happen to match (silent -EPERM = the
+dispatcher's unrecognized-command default). The matched client for any
+machine is its OWN /usr/lib/libhardware2.so: decode its pwm_config call
+site for the real number. Every fx-pwm ioctl number can be overridden
+per-run without a rebuild, e.g.
+
+    FX_PWM_IOC_CONFIG=0x........ fx-pwm config pc12 freq=50000000 ...
+
+Valid names: REQUEST RELEASE CONFIG SET_WC SET_PRESCALE SET_LEVEL
+GET_LEVEL ENABLE_CHANNELS DISABLE_CHANNELS NOT_REALLY_ENABLE
+NOT_REALLY_DISABLE. Values come from decoding, never guessing.
+
 ## The tone verb and Forge-X's TONE command
 
 Forge-X's Klipper plugin `tone_player.py` (the `TONE` command behind its
