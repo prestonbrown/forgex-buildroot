@@ -574,26 +574,12 @@ static void dma_renote(int fd, int ch, long half)
 static void dma_silence(int fd, int ch)
 {
 	/*
-	 * The driver's disable ioctl wedges nondeterministically after
-	 * loops - measured repeatedly on the rig, recovery is a reboot.
-	 * The channel-disable REGISTER write never wedges (it is the poke
-	 * that recovered every wedge tonight): bit <ch> of the disable
-	 * register at PWM2 base + 0x04. Fall back to the ioctl only when
-	 * /dev/mem is unavailable.
+	 * The disable ioctl is what clears the driver's internal dma-armed
+	 * flag - skipping it (a register-write stop only clears the output)
+	 * leaves armed state that wedges the NEXT invocation's release.
+	 * This exact lifecycle - release-first setup, dma cycle, disable,
+	 * trailing release - ran hundreds of times clean in tone_player.
 	 */
-	int mem = open("/dev/mem", O_RDWR | O_SYNC);
-
-	if (mem >= 0) {
-		void *p = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
-			       MAP_SHARED, mem, 0x13610000);
-		if (p != MAP_FAILED) {
-			*(volatile uint32_t *)((char *)p + 0x04) = (1u << ch);
-			munmap(p, 0x1000);
-			close(mem);
-			return;
-		}
-		close(mem);
-	}
 	if (ioctl(fd, ioc_DMA_DISABLE_LOOP(PWM_IOC_DMA_DISABLE_LOOP),
 		  (unsigned long)ch) < 0)
 		die("failed: pwm_dma_disable_loop (%s)\n", strerror(errno));
@@ -868,21 +854,12 @@ static int cmd_sine(int fd, const char *gpio, const double *notes,
 	cfg.max_level = 300;
 
 	ch = pwm_request_channel(fd, gpio);
+	pwm_release_channel(fd, ch, gpio);
+	ch = pwm_request_channel(fd, gpio);
 	arm_signal_release(fd, ch, gpio);
 
 	cfg.channel = (uint32_t)ch;
-	/*
-	 * NO release-first and config failure is tolerated: pwm2_release
-	 * after DMA use D-wedges nondeterministically wherever it sits
-	 * (measured in teardown AND in this setup cycle), and a wedged
-	 * child holding the instance flock silences everything after it.
-	 * A requested channel is simply re-returned by REQUEST, and a
-	 * refused config leaves the channel configured from boot - stock
-	 * itself ignores this refusal ("Cannot configure at working").
-	 */
-	if (ioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg) < 0)
-		step("pwm_config refused (%s) - continuing on the boot config\n",
-		     strerror(errno));
+	xioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg, "pwm_config");
 
 	v.channel = (uint32_t)ch;
 	v.value = (uint32_t)prescale;
@@ -923,15 +900,8 @@ static int cmd_sine(int fd, const char *gpio, const double *notes,
 		usleep((useconds_t)(ms * 1000));
 	}
 	dma_silence(fd, ch);
-	/*
-	 * Deliberately NO trailing release: pwm2_release after DMA use
-	 * D-wedged children on the rig, and a wedged child holding the
-	 * instance flock silences everything after it. The orphaned claim
-	 * recovers - the next invocation's release-first request cycle
-	 * picks the channel back up (tone_player ran that pattern hundreds
-	 * of times clean in one night).
-	 */
-	g_channel = -1;
+	g_channel = -1; /* the release below is the clean one */
+	pwm_release_channel(fd, ch, gpio);
 	return 0;
 }
 
@@ -972,21 +942,12 @@ static int cmd_words(int fd, const char *gpio, const char *path,
 	cfg.max_level = 300;
 
 	ch = pwm_request_channel(fd, gpio);
+	pwm_release_channel(fd, ch, gpio);
+	ch = pwm_request_channel(fd, gpio);
 	arm_signal_release(fd, ch, gpio);
 
 	cfg.channel = (uint32_t)ch;
-	/*
-	 * NO release-first and config failure is tolerated: pwm2_release
-	 * after DMA use D-wedges nondeterministically wherever it sits
-	 * (measured in teardown AND in this setup cycle), and a wedged
-	 * child holding the instance flock silences everything after it.
-	 * A requested channel is simply re-returned by REQUEST, and a
-	 * refused config leaves the channel configured from boot - stock
-	 * itself ignores this refusal ("Cannot configure at working").
-	 */
-	if (ioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg) < 0)
-		step("pwm_config refused (%s) - continuing on the boot config\n",
-		     strerror(errno));
+	xioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg, "pwm_config");
 
 	v.channel = (uint32_t)ch;
 	v.value = (uint32_t)prescale;
@@ -1009,15 +970,8 @@ static int cmd_words(int fd, const char *gpio, const char *path,
 	step("words: %ld words, %ld ms\n", nwords, ms);
 	usleep((useconds_t)(ms * 1000));
 	dma_silence(fd, ch);
-	/*
-	 * Deliberately NO trailing release: pwm2_release after DMA use
-	 * D-wedged children on the rig, and a wedged child holding the
-	 * instance flock silences everything after it. The orphaned claim
-	 * recovers - the next invocation's release-first request cycle
-	 * picks the channel back up (tone_player ran that pattern hundreds
-	 * of times clean in one night).
-	 */
-	g_channel = -1;
+	g_channel = -1; /* the release below is the clean one */
+	pwm_release_channel(fd, ch, gpio);
 	return 0;
 }
 
