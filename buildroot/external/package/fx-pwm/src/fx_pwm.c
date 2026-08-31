@@ -868,12 +868,21 @@ static int cmd_sine(int fd, const char *gpio, const double *notes,
 	cfg.max_level = 300;
 
 	ch = pwm_request_channel(fd, gpio);
-	pwm_release_channel(fd, ch, gpio);
-	ch = pwm_request_channel(fd, gpio);
 	arm_signal_release(fd, ch, gpio);
 
 	cfg.channel = (uint32_t)ch;
-	xioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg, "pwm_config");
+	/*
+	 * NO release-first and config failure is tolerated: pwm2_release
+	 * after DMA use D-wedges nondeterministically wherever it sits
+	 * (measured in teardown AND in this setup cycle), and a wedged
+	 * child holding the instance flock silences everything after it.
+	 * A requested channel is simply re-returned by REQUEST, and a
+	 * refused config leaves the channel configured from boot - stock
+	 * itself ignores this refusal ("Cannot configure at working").
+	 */
+	if (ioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg) < 0)
+		step("pwm_config refused (%s) - continuing on the boot config\n",
+		     strerror(errno));
 
 	v.channel = (uint32_t)ch;
 	v.value = (uint32_t)prescale;
@@ -963,12 +972,21 @@ static int cmd_words(int fd, const char *gpio, const char *path,
 	cfg.max_level = 300;
 
 	ch = pwm_request_channel(fd, gpio);
-	pwm_release_channel(fd, ch, gpio);
-	ch = pwm_request_channel(fd, gpio);
 	arm_signal_release(fd, ch, gpio);
 
 	cfg.channel = (uint32_t)ch;
-	xioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg, "pwm_config");
+	/*
+	 * NO release-first and config failure is tolerated: pwm2_release
+	 * after DMA use D-wedges nondeterministically wherever it sits
+	 * (measured in teardown AND in this setup cycle), and a wedged
+	 * child holding the instance flock silences everything after it.
+	 * A requested channel is simply re-returned by REQUEST, and a
+	 * refused config leaves the channel configured from boot - stock
+	 * itself ignores this refusal ("Cannot configure at working").
+	 */
+	if (ioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg) < 0)
+		step("pwm_config refused (%s) - continuing on the boot config\n",
+		     strerror(errno));
 
 	v.channel = (uint32_t)ch;
 	v.value = (uint32_t)prescale;
