@@ -84,6 +84,44 @@ IOC_OVERRIDE(ENABLE_CHANNELS, PWM_IOC_ENABLE_CHANNELS)
 IOC_OVERRIDE(DISABLE_CHANNELS, PWM_IOC_DISABLE_CHANNELS)
 IOC_OVERRIDE(NOT_REALLY_ENABLE, PWM_IOC_NOT_REALLY_ENABLE)
 IOC_OVERRIDE(NOT_REALLY_DISABLE, PWM_IOC_NOT_REALLY_DISABLE)
+IOC_OVERRIDE(DMA_INIT, PWM_IOC_DMA_INIT)
+IOC_OVERRIDE(DMA_OP, PWM_IOC_DMA_OP)
+IOC_OVERRIDE(DMA_DISABLE_LOOP, PWM_IOC_DMA_DISABLE_LOOP)
+
+/*
+ * A process killed between REQUEST and RELEASE leaves the gpio claim
+ * orphaned, and the vendor driver's next REQUEST on an orphaned claim can
+ * block forever in soc_gpio's lock path (D-state, alarm-proof; only a
+ * reboot clears it - measured twice on the rig). Catch the fatal signals
+ * and try to release before dying. If the thread is already stuck in the
+ * kernel the handler never runs and the reboot is still the only out,
+ * but for every kill that lands between ioctls this keeps the machine
+ * beeping instead of bricking its buzzer until the next boot.
+ */
+static int g_fd = -1;
+static int g_channel = -1;
+static const char *g_gpio_name;
+
+static void release_and_exit(int sig)
+{
+	if (g_fd >= 0 && g_channel >= 0)
+		ioctl(g_fd, ioc_RELEASE(PWM_IOC_RELEASE), (unsigned long)g_channel);
+	_exit(128 + sig);
+}
+
+static void arm_signal_release(int fd, int ch, const char *gpio)
+{
+	struct sigaction sa;
+
+	g_fd = fd;
+	g_channel = ch;
+	g_gpio_name = gpio;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = release_and_exit;
+	sigaction(SIGALRM, &sa, NULL);
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+}
 
 /*
  * gpio allowlist. The kernel driver's own table (pwm_gpio_array, decoded
@@ -115,8 +153,11 @@ static void usage(FILE *out)
 "  disable_channels <gpio> [gpio ...]\n"
 "  not_really_enable <gpio>\n"
 "  not_really_disable <gpio>\n"
-"  tone <gpio> <notes> [--base=<hz>] [--prescale=<n>]\n"
-"                                  (notes: \"freq:ms ...\"; bare number = rest ms)\n"
+"  tone <gpio> <notes> [--base=<hz>] [--prescale=<n>] [--backend=dma|setwc|auto]\n"
+"                                  (notes: \"freq:ms ...\"; bare number = rest ms;\n"
+"                                   default backend is the stock DMA tone path\n"
+"                                   with set_wc as fallback - set_wc alone can\n"
+"                                   only beep once per boot on this driver)\n"
 "  probe <gpio>                    (request, report the kernel's channel, no output change)\n"
 "  selftest [gpio] [--tone-hz=<f>] [--prescale=<n>] [--ms=<n>]\n"
 "  --selftest                       (same as: selftest pc12)\n"
@@ -439,16 +480,85 @@ static int cmd_probe(int fd, const char *gpio)
  * base/prescale with base defaulting to the stock 50 MHz assumption; once
  * the real parent rate is measured on a machine, pass --base=.
  */
-static int cmd_tone(int fd, const char *gpio, const char *notes, long base, long prescale)
+/*
+ * Loop length for DMA tones. The driver requires a multiple of 4 words;
+ * 4 identical period-words is the shortest legal loop and repeats fast
+ * enough that the output is a continuous tone.
+ */
+#define DMA_LOOP_WORDS 4
+
+/*
+ * Push one period word `count` times and start the loop. Same 16-bit
+ * halves as set_wc; the DMA engine replays them continuously until
+ * disabled, with none of set_wc's one-shot update-engine wedging.
+ */
+static void dma_note(int fd, int ch, long half)
+{
+	struct pwm_dma_op_args op;
+	uint32_t words[DMA_LOOP_WORDS];
+	int i;
+
+	for (i = 0; i < DMA_LOOP_WORDS; i++)
+		words[i] = PWM_WC(half, half);
+
+	memset(&op, 0, sizeof(op));
+	op.channel = (uint32_t)ch;
+	op.count = DMA_LOOP_WORDS;
+	op.data = (uint32_t)(uintptr_t)words;
+	op.op = 0; /* copy the buffer in */
+	xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op, "pwm_dma_update");
+	op.op = 1; /* loop it */
+	xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op, "pwm_dma_enable_loop");
+}
+
+static void dma_silence(int fd, int ch)
+{
+	if (ioctl(fd, ioc_DMA_DISABLE_LOOP(PWM_IOC_DMA_DISABLE_LOOP),
+		  (unsigned long)ch) < 0)
+		die("failed: pwm_dma_disable_loop (%s)\n", strerror(errno));
+}
+
+static int cmd_tone(int fd, const char *gpio, const char *notes,
+		    long base, long prescale, const char *backend)
 {
 	struct pwm_config_args cfg;
 	struct pwm_ch_value v;
+	struct pwm_dma_init_args di;
 	const char *p = notes;
 	long clock = base / prescale;
-	int ch;
+	int ch, use_dma;
 
 	if (clock <= 0)
 		die("error: base clock %ld / prescale %ld is not positive\n", base, prescale);
+
+	/*
+	 * The default watchdog is tuned for one-shot verbs; a tune can be
+	 * minutes long. Re-arm to the tune's total duration plus slack so
+	 * the alarm only fires on a real wedge, never on a long melody.
+	 */
+	{
+		double total_ms = 0;
+		char *end;
+		const char *q = notes;
+
+		while (*q) {
+			double v = strtod(q, &end);
+
+			if (end == q)
+				break;
+			q = end;
+			if (*q == ':') {
+				q++;
+				strtod(q, &end);
+				q = end;
+			}
+			total_ms += v;
+			while (*q == ' ' || *q == '\t')
+				q++;
+		}
+		alarm(0);
+		alarm((unsigned)(total_ms / 1000.0) + 3);
+	}
 
 	/*
 	 * config's freq is only bookkeeping for this flow (set_prescale and
@@ -464,12 +574,44 @@ static int cmd_tone(int fd, const char *gpio, const char *notes, long base, long
 	cfg.max_level = 300;
 
 	ch = pwm_request_channel(fd, gpio);
+
+	/*
+	 * A channel left "working" by the stock boot beep (or any earlier
+	 * set_wc success) refuses both CONFIG and DMA_INIT, and only RELEASE
+	 * clears the flag - measured on the rig. Release and re-request
+	 * unconditionally so tone works whatever state the machine is in.
+	 */
+	pwm_release_channel(fd, ch, gpio);
+	ch = pwm_request_channel(fd, gpio);
+	arm_signal_release(fd, ch, gpio);
+
 	cfg.channel = (uint32_t)ch;
 	xioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg, "pwm_config");
 
 	v.channel = (uint32_t)ch;
 	v.value = (uint32_t)prescale;
 	xioctl(fd, ioc_SET_PRESCALE(PWM_IOC_SET_PRESCALE), &v, "pwm_set_prescale");
+
+	/*
+	 * DMA is how stock beeps; prefer it and fall back to the one-shot
+	 * set_wc path when the ioctl is not recognized (older module) or the
+	 * channel refuses it. --backend= pins the choice for bring-up.
+	 */
+	use_dma = strcmp(backend, "setwc") != 0;
+	if (use_dma) {
+		memset(&di, 0, sizeof(di));
+		di.channel = (uint32_t)ch;
+		di.active_level = 1;
+		di.loop = 1;
+		if (ioctl(fd, ioc_DMA_INIT(PWM_IOC_DMA_INIT), &di) < 0) {
+			if (strcmp(backend, "dma") == 0)
+				die("failed: pwm_dma_init (%s, see dmesg)\n",
+				    strerror(errno));
+			step("dma init refused (%s), falling back to set_wc\n",
+			     strerror(errno));
+			use_dma = 0;
+		}
+	}
 
 	while (*p) {
 		char *end;
@@ -501,9 +643,17 @@ static int cmd_tone(int fd, const char *gpio, const char *notes, long base, long
 				die("error: frequency %.2f Hz does not fit the 16-bit halves "
 				    "(channel clock %ld Hz)\n", freq, clock);
 
+			if (use_dma) {
+				if (ms > 0) {
+					dma_note(fd, ch, half);
+					usleep((useconds_t)(ms * 1000));
+					dma_silence(fd, ch);
+				}
+				continue;
+			}
 			v.value = PWM_WC(half, half);
 			xioctl(fd, ioc_SET_WC(PWM_IOC_SET_WC), &v, "pwm_set_wc");
-		} else {
+		} else if (!use_dma) {
 			v.value = PWM_WC(0, 0); /* stock silence idiom */
 			xioctl(fd, ioc_SET_WC(PWM_IOC_SET_WC), &v, "pwm_set_wc");
 		}
@@ -512,8 +662,13 @@ static int cmd_tone(int fd, const char *gpio, const char *notes, long base, long
 			usleep((useconds_t)(ms * 1000));
 	}
 
-	v.value = PWM_WC(0, 0);
-	xioctl(fd, ioc_SET_WC(PWM_IOC_SET_WC), &v, "pwm_set_wc");
+	if (!use_dma) {
+		v.value = PWM_WC(0, 0);
+		xioctl(fd, ioc_SET_WC(PWM_IOC_SET_WC), &v, "pwm_set_wc");
+	}
+	/* DMA mode needs no trailing stop: every note's disable already ran,
+	 * and a further disable_loop is refused with "dma is not loop". */
+	g_channel = -1; /* the release below is the clean one */
 	pwm_release_channel(fd, ch, gpio);
 	return 0;
 }
@@ -691,6 +846,7 @@ int main(int argc, char **argv)
 		return cmd_not_really(fd, gpio, ioc_NOT_REALLY_DISABLE(PWM_IOC_NOT_REALLY_DISABLE), "pwm_not_really_disable");
 	if (strcmp(verb, "tone") == 0) {
 		long base = 50000000, prescale = 6;
+		const char *backend = "auto";
 
 		if (argc < 4)
 			die("error: tone needs a notes string, e.g. \"1000:100 50 1479:200\"\n");
@@ -699,10 +855,16 @@ int main(int argc, char **argv)
 				base = parse_long(argv[i] + 7, "base");
 			else if (strncmp(argv[i], "--prescale=", 11) == 0)
 				prescale = parse_long(argv[i] + 11, "prescale");
-			else if (strncmp(argv[i], "--", 2) != 0)
+			else if (strncmp(argv[i], "--backend=", 10) == 0) {
+				backend = argv[i] + 10;
+				if (strcmp(backend, "dma") != 0 &&
+				    strcmp(backend, "setwc") != 0 &&
+				    strcmp(backend, "auto") != 0)
+					die("error: --backend must be dma, setwc, or auto\n");
+			} else if (strncmp(argv[i], "--", 2) != 0)
 				die("error: not support this arg: %s\n", argv[i]);
 		}
-		return cmd_tone(fd, gpio, argv[3], base, prescale);
+		return cmd_tone(fd, gpio, argv[3], base, prescale, backend);
 	}
 	if (strcmp(verb, "probe") == 0)
 		return cmd_probe(fd, gpio);

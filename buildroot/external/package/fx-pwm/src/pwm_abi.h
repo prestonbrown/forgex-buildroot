@@ -72,6 +72,42 @@ struct pwm_level_args {
 #define PWM_IOC_DISABLE_CHANNELS 0x80045063 /* _IOR('P', 0x63, 4) */
 
 /*
+ * DMA tone path - how stock actually beeps. libhardware2 exports
+ * pwm_dma_init/send/update/enable_loop/disable_loop and the stock host
+ * drives every beep through them; SET_WC is static-duty only and wedges
+ * this driver's waveform-update engine after a single use (busy bit at
+ * PWM2+0x14 sticks until reboot - measured twice on the rig). The DMA
+ * path has no such limit.
+ *
+ * Buffer format, from pwm_dma_send in libhardware2.so: each 32-bit word
+ * is one waveform period {u16 low, u16 high}, packed exactly like
+ * SET_WC's value (high << 16 | low). pwm_dma_send(hi, lo, count) fills
+ * `count` identical words and forwards them to the update ioctl, so a
+ * loop of identical words is a steady tone at
+ * channel_clock / (count * (high + low)) per pass - the entries simply
+ * repeat. Loop counts must be a multiple of 4 words ("dma loop data
+ * length must 4 word align!" in the library).
+ */
+#define PWM_IOC_DMA_INIT 0x800c5037 /* _IOR('P', 0x37, 12) */
+struct pwm_dma_init_args {
+	uint32_t channel;      /* @0: channel index from REQUEST */
+	uint32_t active_level; /* @4: normalized to 0/1, stored like config's */
+	uint32_t loop;         /* @8: loop-mode flag */
+};
+
+/* One ioctl, two ops selected by the third word (libhardware2 shares it). */
+#define PWM_IOC_DMA_OP 0xc0105042 /* _IOWR('P', 0x42, 16) */
+struct pwm_dma_op_args {
+	uint32_t data;    /* @0: user buffer of period words */
+	uint32_t count;   /* @4: words in the buffer; multiple of 4 to loop */
+	uint32_t op;      /* @8: 0 = copy the buffer, 1 = loop it */
+	uint32_t channel; /* @12: channel index from REQUEST */
+};
+
+/* DISABLE_LOOP - arg is the channel index BY VALUE, like RELEASE. */
+#define PWM_IOC_DMA_DISABLE_LOOP 0x8001504d /* _IOR('P', 0x4d, 4) */
+
+/*
  * struct pwm_config_args field order matches what pwm2_config() reads.
  * The channel index is the driver's pwmdata index, NOT the gpio id, and
  * comes from the REQUEST ioctl's return value (vendor table: pb12..pb19
