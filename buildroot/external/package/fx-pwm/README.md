@@ -53,20 +53,25 @@ wrapping each tune. The rig's parent clock measures 384 MHz.
 
 ## OEM-build ioctl drift and the FX_PWM_IOC_* overrides
 
-The rig's running soc_pwm is evidently NOT the Factory 1.1.7 build (its
-kallsyms function order differs from the 1.1.7 file's - pwm2_request
-sits below pwm_open), and its CONFIG command encoding apparently differs
-while REQUEST and GET_LEVEL happen to match (silent -EPERM = the
-dispatcher's unrecognized-command default). The matched client for any
-machine is its OWN /usr/lib/libhardware2.so: decode its pwm_config call
-site for the real number. Every fx-pwm ioctl number can be overridden
-per-run without a rebuild, e.g.
+History worth remembering: the CONFIG command is `_IOR('P', 0x21, 24)` =
+0x80185021, and an early decode of this package hand-converted the
+dispatcher's addiu immediate (20513 decimal) as 0x5001 instead of
+0x5021 - shipping 0x80185001, which matches no handler and falls to the
+silent -1 default (EPERM with nothing in dmesg). That single wrong digit
+cost five rig sessions of theories before a scripted re-derivation of
+every command constant caught it. Lesson: convert disassembly immediates
+mechanically, never by eye; every rejection path in this driver printk's,
+so a truly silent ioctl failure is always an unrecognized command number.
 
-    FX_PWM_IOC_CONFIG=0x........ fx-pwm config pc12 freq=50000000 ...
+The FX_PWM_IOC_* overrides stay as a bring-up aid for machines whose OEM
+build really does differ (verify against that machine's own
+libhardware2.so, never guess):
+
+    FX_PWM_IOC_CONFIG=0x80185021 fx-pwm config pc12 freq=50000000 ...
 
 Valid names: REQUEST RELEASE CONFIG SET_WC SET_PRESCALE SET_LEVEL
 GET_LEVEL ENABLE_CHANNELS DISABLE_CHANNELS NOT_REALLY_ENABLE
-NOT_REALLY_DISABLE. Values come from decoding, never guessing.
+NOT_REALLY_DISABLE.
 
 ## The tone verb and Forge-X's TONE command
 
@@ -137,7 +142,7 @@ agree on every field. Type is 'P' (0x50):
 |---|---|---|
 | `0x8001500b` | `char[12]` gpio name | request by name ("pc12"); kernel resolves and refuses non-PWM gpios |
 | `0x80045016` | `u32` channel **by value** | release (disable + unrequest) |
-| `0x80185001` | 24-byte config struct | `{_pad, active_level, levels_exact, freq_hz, max_level, channel}` |
+| `0x80185021` | 24-byte config struct | `{_pad, active_level, levels_exact, freq_hz, max_level, channel}` |
 | `0xc004502d` | `{ch, hi<<16\|lo}` | set_wc: raw duty halves, latches period and muxes the pin |
 | `0xc004502e` | `{ch, N}` | set_prescale: clock divider register = N-1 |
 | `0xc004502c` | `{ch, level}` | set_level: duty = level x period / max_level |

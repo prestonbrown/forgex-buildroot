@@ -37,7 +37,7 @@
 #define PWM_IOC_RELEASE 0x80045016 /* _IOR('P', 0x16, int) */
 
 /* CONFIG - arg is struct pwm_config_args (24 bytes). */
-#define PWM_IOC_CONFIG 0x80185001 /* _IOR('P', 0x01, 24) */
+#define PWM_IOC_CONFIG 0x80185021 /* _IOR('P', 0x21, 24) */
 
 /* SET_WC - arg is struct pwm_ch_value; wc = (high << 16) | low. */
 #define PWM_IOC_SET_WC 0xc004502d /* _IOWR('P', 0x2d, 8) */
@@ -129,7 +129,7 @@ struct pwm_ch_value {
  * differs in some command encodings (observed on the AD5X rig: REQUEST
  * and GET_LEVEL match across builds, CONFIG does not - silent -EPERM).
  * Any number can be overridden per-run through the environment, e.g.
- * FX_PWM_IOC_CONFIG=0x40185001 fx-pwm config pc12 ... - values should
+ * FX_PWM_IOC_CONFIG=0x80185021 fx-pwm config pc12 ... - values should
  * come from decoding that machine's own libhardware2.so pwm_config call
  * site, not from guessing.
  */
