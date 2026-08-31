@@ -714,19 +714,86 @@ static int cmd_tone(int fd, const char *gpio, const char *notes,
  * which is the foundation for real audio synthesis on this transducer.
  */
 #define SINE_BUF_WORDS 4096
+#define CHORD_MAX_NOTES 4
 
-static int cmd_sine(int fd, const char *gpio, double freq, double ms,
-		    double carrier, long base, long prescale, double swap)
+/*
+ * Triangle sample of `freq` at carrier-sample index i, scaled
+ * -1000..1000. Phase is tracked in 1/1000-cycle units so integer
+ * arithmetic stays exact for fractional frequencies.
+ */
+static long tri_sample(double freq, long i, long c_total, long c_half)
+{
+	long pos = (long)((unsigned long long)(freq * 1000.0) * i) % c_total;
+
+	if (pos < c_half)
+		return -1000 + 2000 * pos / c_half;
+	return 1000 - 2000 * (pos - c_half) / c_half;
+}
+
+/*
+ * Fill a duty-encoded buffer with the sum of up to CHORD_MAX_NOTES
+ * triangle generators - a chord in a single one-shot loop. Tuner-
+ * verified on the rig: the piezo demodulates duty-encoded audio (a
+ * single 440 Hz triangle reads as its 440 fundamental plus a
+ * resonance-boosted 11th harmonic near 4.8 kHz), so simultaneous tones
+ * survive the transducer.
+ */
+static void fill_chord_words(uint32_t *words, long nwords,
+			     const double *notes, int n_notes,
+			     long period, long c_total, long c_half)
+{
+	long half = period / 2;
+	long amp = period * 2 / 5;
+	long w[CHORD_MAX_NOTES], wsum = 0;
+	long i;
+	int n;
+
+	/*
+	 * The disc's response rises with frequency (its mechanical
+	 * resonance sits near 5 kHz), so an unweighted chord comes out
+	 * treble-heavy. Weight notes by inverse SQUARE ROOT of frequency -
+	 * ear-tuned on the rig: 1/f overcorrected, unweighted was too
+	 * bright, f^-0.5 sits between.
+	 */
+	for (n = 0; n < n_notes; n++) {
+		long ratio = (long)(notes[0] * 1000000.0 / notes[n]);
+		long r = ratio, t;
+
+		while (r > 0 && (t = (r + ratio / r) / 2) < r)
+			r = t; /* integer Newton sqrt */
+		w[n] = r;
+		wsum += w[n];
+	}
+
+	for (i = 0; i < nwords; i++) {
+		long long acc = 0;
+		long t, hi;
+
+		for (n = 0; n < n_notes; n++)
+			acc += (long long)tri_sample(notes[n], i, c_total, c_half) * w[n];
+		t = (long)(acc * 1000 / wsum);
+		hi = half + t * amp / 1000;
+		if (hi < 1)
+			hi = 1;
+		if (hi > period - 1)
+			hi = period - 1;
+		words[i] = PWM_WC(period - hi, hi);
+	}
+}
+
+static int cmd_sine(int fd, const char *gpio, const double *notes,
+		    int n_notes, double ms, double carrier, long base,
+		    long prescale, double swap)
 {
 	struct pwm_config_args cfg;
 	struct pwm_ch_value v;
 	struct pwm_dma_init_args di;
 	struct pwm_dma_op_args op;
 	static uint32_t words[SINE_BUF_WORDS];
+	double swap_notes[1];
 	long clock = base / prescale;
-	long period, half, c_total, c_half;
+	long period, c_total, c_half;
 	int ch;
-	long i;
 
 	if (clock <= 0)
 		die("error: base clock %ld / prescale %ld is not positive\n",
@@ -735,27 +802,12 @@ static int cmd_sine(int fd, const char *gpio, double freq, double ms,
 	if (period < 2 || period > 131070)
 		die("error: carrier %.0f Hz does not fit one word "
 		    "(channel clock %ld Hz)\n", carrier, clock);
-	half = period / 2;
 	/* integer phase: track freq*1000 modulo carrier*1000 */
 	c_total = (long)(carrier * 1000.0);
 	c_half = c_total / 2;
 
-	for (i = 0; i < SINE_BUF_WORDS; i++) {
-		long pos = (long)((unsigned long long)(freq * 1000.0) * i) % c_total;
-		long tri, hi;
-
-		if (pos < c_half)
-			tri = -1000 + 2000 * pos / c_half;
-		else
-			tri = 1000 - 2000 * (pos - c_half) / c_half;
-		/* +/-40% duty swing around 50% */
-		hi = half + tri * (period * 2 / 5) / 1000;
-		if (hi < 1)
-			hi = 1;
-		if (hi > period - 1)
-			hi = period - 1;
-		words[i] = PWM_WC(period - hi, hi);
-	}
+	fill_chord_words(words, SINE_BUF_WORDS, notes, n_notes,
+			 period, c_total, c_half);
 
 	alarm((unsigned)(ms / 1000.0) + 3);
 
@@ -791,29 +843,18 @@ static int cmd_sine(int fd, const char *gpio, double freq, double ms,
 	xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op, "pwm_dma_update");
 	op.op = 1;
 	xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op, "pwm_dma_enable_loop");
-	printf("sine %.0f Hz, %.0f Hz carrier (%ld counts/cycle), %d words "
-	       "(%.0f ms), %.0f ms\n", freq, carrier, period, SINE_BUF_WORDS,
+	printf("sine %.0f Hz (%d note%s), %.0f Hz carrier (%ld counts/cycle), "
+	       "%d words (%.0f ms), %.0f ms\n", notes[0], n_notes,
+	       n_notes == 1 ? "" : "s", carrier, period, SINE_BUF_WORDS,
 	       SINE_BUF_WORDS * 1000.0 / carrier, ms);
 	fflush(stdout);
 	if (swap > 0) {
 		usleep((useconds_t)(ms * 500.0));
 		/* swap the running loop's buffer: one op-0 copy, no
 		 * disable/enable around it - the streaming primitive */
-		for (i = 0; i < SINE_BUF_WORDS; i++) {
-			long pos = (long)((unsigned long long)(swap * 1000.0) * i) % c_total;
-			long tri, hi;
-
-			if (pos < c_half)
-				tri = -1000 + 2000 * pos / c_half;
-			else
-				tri = 1000 - 2000 * (pos - c_half) / c_half;
-			hi = half + tri * (period * 2 / 5) / 1000;
-			if (hi < 1)
-				hi = 1;
-			if (hi > period - 1)
-				hi = period - 1;
-			words[i] = PWM_WC(period - hi, hi);
-		}
+		swap_notes[0] = swap;
+		fill_chord_words(words, SINE_BUF_WORDS, swap_notes, 1,
+				 period, c_total, c_half);
 		op.op = 0;
 		xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op, "pwm_dma_update");
 		printf("swapped to %.0f Hz under the running loop\n", swap);
@@ -1022,13 +1063,32 @@ int main(int argc, char **argv)
 		return cmd_tone(fd, gpio, argv[3], base, prescale, backend);
 	}
 	if (strcmp(verb, "sine") == 0) {
-		double freq = 440.0, ms = 1500.0, carrier = 32000.0, swap = 0.0;
+		double notes[CHORD_MAX_NOTES], ms = 1500.0, carrier = 32000.0;
+		double swap = 0.0;
 		long base = 50000000, prescale = 6;
+		int n_notes = 0;
 
 		for (i = 4; i < argc; i++) {
-			if (strncmp(argv[i], "--freq=", 7) == 0)
-				freq = strtod(argv[i] + 7, NULL);
-			else if (strncmp(argv[i], "--carrier=", 10) == 0)
+			if (strncmp(argv[i], "--freq=", 7) == 0) {
+				if (n_notes == 0) {
+					notes[0] = strtod(argv[i] + 7, NULL);
+					n_notes = 1;
+				}
+			} else if (strncmp(argv[i], "--notes=", 8) == 0) {
+				char spec[128], *p, *tok;
+
+				snprintf(spec, sizeof(spec), "%s", argv[i] + 8);
+				n_notes = 0;
+				for (tok = strtok_r(spec, ",", &p); tok;
+				     tok = strtok_r(NULL, ",", &p)) {
+					if (n_notes >= CHORD_MAX_NOTES)
+						die("error: at most %d notes\n",
+						    CHORD_MAX_NOTES);
+					notes[n_notes++] = strtod(tok, NULL);
+				}
+				if (n_notes == 0)
+					die("error: --notes= needs frequencies\n");
+			} else if (strncmp(argv[i], "--carrier=", 10) == 0)
 				carrier = strtod(argv[i] + 10, NULL);
 			else if (strncmp(argv[i], "--ms=", 5) == 0)
 				ms = strtod(argv[i] + 5, NULL);
@@ -1041,7 +1101,12 @@ int main(int argc, char **argv)
 			else if (strncmp(argv[i], "--", 2) != 0)
 				die("error: not support this arg: %s\n", argv[i]);
 		}
-		return cmd_sine(fd, gpio, freq, ms, carrier, base, prescale, swap);
+		if (n_notes == 0) {
+			notes[0] = 440.0;
+			n_notes = 1;
+		}
+		return cmd_sine(fd, gpio, notes, n_notes, ms, carrier,
+				base, prescale, swap);
 	}
 	if (strcmp(verb, "probe") == 0)
 		return cmd_probe(fd, gpio);
