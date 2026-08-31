@@ -914,8 +914,15 @@ static int cmd_sine(int fd, const char *gpio, const double *notes,
 		usleep((useconds_t)(ms * 1000));
 	}
 	dma_silence(fd, ch);
-	g_channel = -1; /* the release below is the clean one */
-	pwm_release_channel(fd, ch, gpio);
+	/*
+	 * Deliberately NO trailing release: pwm2_release after DMA use
+	 * D-wedged children on the rig, and a wedged child holding the
+	 * instance flock silences everything after it. The orphaned claim
+	 * recovers - the next invocation's release-first request cycle
+	 * picks the channel back up (tone_player ran that pattern hundreds
+	 * of times clean in one night).
+	 */
+	g_channel = -1;
 	return 0;
 }
 
@@ -984,8 +991,15 @@ static int cmd_words(int fd, const char *gpio, const char *path,
 	step("words: %ld words, %ld ms\n", nwords, ms);
 	usleep((useconds_t)(ms * 1000));
 	dma_silence(fd, ch);
-	g_channel = -1; /* the release below is the clean one */
-	pwm_release_channel(fd, ch, gpio);
+	/*
+	 * Deliberately NO trailing release: pwm2_release after DMA use
+	 * D-wedged children on the rig, and a wedged child holding the
+	 * instance flock silences everything after it. The orphaned claim
+	 * recovers - the next invocation's release-first request cycle
+	 * picks the channel back up (tone_player ran that pattern hundreds
+	 * of times clean in one night).
+	 */
+	g_channel = -1;
 	return 0;
 }
 
