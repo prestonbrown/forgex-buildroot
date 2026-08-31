@@ -870,6 +870,76 @@ static int cmd_sine(int fd, const char *gpio, const double *notes,
 }
 
 /*
+ * Raw sample player: read a file of little-endian u32 period words (the
+ * duty-encoding produced by a synthesizer elsewhere - helixscreen's
+ * sound backend), copy+loop it, hold for --ms, then stop and release.
+ * Word count must be a multiple of 4 (driver rule). The caller owns the
+ * DSP; this verb is deliberately dumb.
+ */
+static int cmd_words(int fd, const char *gpio, const char *path,
+		     long ms, long prescale)
+{
+	struct pwm_config_args cfg;
+	struct pwm_ch_value v;
+	struct pwm_dma_init_args di;
+	struct pwm_dma_op_args op;
+	static uint32_t words[65536];
+	FILE *f;
+	long nwords = 0;
+	int ch;
+
+	f = fopen(path, "rb");
+	if (!f)
+		die("error: cannot open %s\n", path);
+	nwords = (long)fread(words, 4, sizeof(words) / 4, f);
+	fclose(f);
+	if (nwords < 4 || nwords % 4 != 0)
+		die("error: %s: %ld words (need a positive multiple of 4)\n",
+		    path, nwords);
+
+	alarm((unsigned)(ms / 1000) + 3);
+
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.active_level = 1;
+	cfg.levels_exact = 0;
+	cfg.freq_hz = 1000000; /* conservative: see cmd_tone */
+	cfg.max_level = 300;
+
+	ch = pwm_request_channel(fd, gpio);
+	pwm_release_channel(fd, ch, gpio);
+	ch = pwm_request_channel(fd, gpio);
+	arm_signal_release(fd, ch, gpio);
+
+	cfg.channel = (uint32_t)ch;
+	xioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg, "pwm_config");
+
+	v.channel = (uint32_t)ch;
+	v.value = (uint32_t)prescale;
+	xioctl(fd, ioc_SET_PRESCALE(PWM_IOC_SET_PRESCALE), &v, "pwm_set_prescale");
+
+	memset(&di, 0, sizeof(di));
+	di.channel = (uint32_t)ch;
+	di.active_level = 1;
+	di.loop = 1;
+	xioctl(fd, ioc_DMA_INIT(PWM_IOC_DMA_INIT), &di, "pwm_dma_init");
+
+	memset(&op, 0, sizeof(op));
+	op.channel = (uint32_t)ch;
+	op.count = (uint32_t)nwords;
+	op.data = (uint32_t)(uintptr_t)words;
+	op.op = 0;
+	xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op, "pwm_dma_update");
+	op.op = 1;
+	xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op, "pwm_dma_enable_loop");
+	step("words: %ld words, %ld ms\n", nwords, ms);
+	usleep((useconds_t)(ms * 1000));
+	dma_silence(fd, ch);
+	g_channel = -1; /* the release below is the clean one */
+	pwm_release_channel(fd, ch, gpio);
+	return 0;
+}
+
+/*
  * Bring-up aid for a human listening: stock-parity config, then two tones
  * whose period counts bracket the plausible parent-clock rates (the vendor
  * driver defaults its rate global to 500 MHz before clk_get_rate; the
@@ -1107,6 +1177,21 @@ int main(int argc, char **argv)
 		}
 		return cmd_sine(fd, gpio, notes, n_notes, ms, carrier,
 				base, prescale, swap);
+	}
+	if (strcmp(verb, "words") == 0) {
+		long ms = 500, prescale = 6;
+
+		if (argc < 4)
+			die("error: words needs a file path of u32 period words\n");
+		for (i = 4; i < argc; i++) {
+			if (strncmp(argv[i], "--ms=", 5) == 0)
+				ms = parse_long(argv[i] + 5, "ms");
+			else if (strncmp(argv[i], "--prescale=", 11) == 0)
+				prescale = parse_long(argv[i] + 11, "prescale");
+			else if (strncmp(argv[i], "--", 2) != 0)
+				die("error: not support this arg: %s\n", argv[i]);
+		}
+		return cmd_words(fd, gpio, argv[3], ms, prescale);
 	}
 	if (strcmp(verb, "probe") == 0)
 		return cmd_probe(fd, gpio);
