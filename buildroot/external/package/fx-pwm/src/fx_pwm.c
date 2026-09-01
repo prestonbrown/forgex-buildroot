@@ -55,7 +55,12 @@
 
 #include <sys/ioctl.h>
 #include <sys/file.h>
+#include <time.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
+#include <poll.h>
 
 #include "pwm_abi.h"
 
@@ -63,6 +68,12 @@
 #define PWM_DEVICE_ALT  "/dev/misc/jz_pwm"
 
 static int g_watchdog_seconds = 5;
+
+/* serve: set when a zero-length frame cancels the running hold. Safe to
+ * set from the normal (non-signal) path only; SIGALRM never touches it. */
+static volatile sig_atomic_t g_cancel_hold;
+/* serve: a phrase hold is running - receipt-ack drops new frames with 1. */
+static volatile sig_atomic_t g_holding;
 
 /*
  * One fx-pwm on the channel at a time. Concurrent invocations interleave
@@ -741,6 +752,110 @@ static int cmd_tone(int fd, const char *gpio, const char *notes,
 }
 
 /*
+ * Chunk-cycle probe: the streaming question, re-asked correctly. The
+ * update handler refuses op-0 only while the loop-armed flag is set
+ * (decoded from pwm2_dma_update: the flag is set by op-1 and cleared by
+ * disable_loop / completion), so the legal chunk cycle is
+ * disable_loop -> op-0 copy -> op-1 arm, all in one process with no
+ * release and no re-init. Play N tones back-to-back through exactly
+ * that cycle and report per-chunk overhead - the number that decides
+ * whether a tracker player is feasible on this engine.
+ */
+static int cmd_chunks(int fd, const char *gpio, long chunk_ms, int n_chunks,
+		      long base, long prescale)
+{
+	struct pwm_config_args cfg;
+	struct pwm_ch_value v;
+	struct pwm_dma_init_args di;
+	struct pwm_dma_op_args op;
+	static uint32_t words[65536];
+	struct timespec t0, t1;
+	long clock = base / prescale;
+	long period, total_us = 0;
+	int ch, i;
+
+	if (clock <= 0)
+		die("error: base/prescale not positive\n");
+	period = clock / 32768;
+	if (period < 4 || period > 131070)
+		die("error: carrier does not fit one word\n");
+
+	alarm(n_chunks * chunk_ms / 1000 + 10);
+
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.active_level = 1;
+	cfg.levels_exact = 0;
+	cfg.freq_hz = 1000000;
+	cfg.max_level = 300;
+
+	ch = pwm_request_channel(fd, gpio);
+	pwm_release_channel(fd, ch, gpio);
+	ch = pwm_request_channel(fd, gpio);
+	arm_signal_release(fd, ch, gpio);
+
+	cfg.channel = (uint32_t)ch;
+	xioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg, "pwm_config");
+
+	v.channel = (uint32_t)ch;
+	v.value = (uint32_t)prescale;
+	xioctl(fd, ioc_SET_PRESCALE(PWM_IOC_SET_PRESCALE), &v, "pwm_set_prescale");
+
+	memset(&di, 0, sizeof(di));
+	di.channel = (uint32_t)ch;
+	di.active_level = 1;
+	di.loop = 1;
+	xioctl(fd, ioc_DMA_INIT(PWM_IOC_DMA_INIT), &di, "pwm_dma_init");
+
+	memset(&op, 0, sizeof(op));
+	op.channel = (uint32_t)ch;
+
+	for (i = 0; i < n_chunks; i++) {
+		/* a rising scale so the ear can hear chunk boundaries:
+		 * 12-step semitone table in milli-multipliers (no libm) */
+		static const long semi[12] = {1000, 1059, 1122, 1189, 1260,
+					      1335, 1414, 1498, 1587, 1682,
+					      1782, 1888};
+		double freq = 440.0 * semi[i % 12] / 1000.0;
+		long nwords = 32768 * chunk_ms / 1000;
+
+		nwords -= nwords % 4;
+		for (long k = 0; k < nwords; k++) {
+			long pos = (long)(freq * 1000.0 * k) % 32768000;
+			long ph = pos % 16000;
+			long tri = -1000 + 2000 * ph / 16000;
+			long on = period / 2 + tri * (period * 2 / 5) / 1000;
+
+			if (on < 1)
+				on = 1;
+			if (on > period - 1)
+				on = period - 1;
+			words[k] = PWM_WC(period - on, on);
+		}
+		op.count = (uint32_t)nwords;
+		op.data = (uint32_t)(uintptr_t)words;
+		op.op = 0;
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+		xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op, "pwm_dma_update");
+		op.op = 1;
+		xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op, "pwm_dma_enable_loop");
+		usleep((useconds_t)chunk_ms * 1000);
+		if (ioctl(fd, ioc_DMA_DISABLE_LOOP(PWM_IOC_DMA_DISABLE_LOOP),
+			  (unsigned long)ch) < 0)
+			die("chunk %d: disable failed (%s)\n", i, strerror(errno));
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+		total_us += (t1.tv_sec - t0.tv_sec) * 1000000 +
+			    (t1.tv_nsec - t0.tv_nsec) / 1000;
+	}
+	long avg = total_us / n_chunks;
+	printf("chunks: %d x %ld ms; per-chunk overhead ~%ld us (%.1f%% gap)\n",
+	       n_chunks, chunk_ms, avg - chunk_ms * 1000,
+	       (avg - chunk_ms * 1000) * 100.0 / avg);
+	g_channel = -1;
+	pwm_release_channel(fd, ch, gpio);
+	return 0;
+}
+
+/*
  * Class-D bring-up probe: one large buffer of period words at a FIXED
  * carrier, each word's duty encoding one sample of a triangle wave. If
  * the engine walks the whole buffer each loop, the piezo reproduces the
@@ -903,6 +1018,335 @@ static int cmd_sine(int fd, const char *gpio, const double *notes,
 	g_channel = -1; /* the release below is the clean one */
 	pwm_release_channel(fd, ch, gpio);
 	return 0;
+}
+
+/*
+ * Sound daemon: the one long-lived owner of the buzzer channel. HelixScreen
+ * (and later klippy's tone_player) connect to a unix socket and hand over
+ * phrase buffers; playing them costs a few ioctls, not a fork+exec+chroot
+ * hop per buffer - the per-spawn lifecycle measured ~200 ms dead time,
+ * which chopped tracker music into 35%-duty fragments.
+ *
+ * Protocol per frame (all fields little-endian):
+ *   u32 magic 0x4A5A5331 ('JZS1')
+ *   u32 hold_ms                     how long to loop the buffer
+ *   u32 nwords                      word count; 0 = "cancel now"
+ *   u32 words[nwords]               period words ({inactive<<16}|active)
+ * One-byte reply: 0 played, 1 dropped (busy), 2 protocol error.
+ *
+ * A frame arriving while a hold is running cancels it if zero-length and
+ * is discarded (reply 1) otherwise - drop-if-busy, never queue: a burst
+ * sheds overlap instead of playing stale notes late.
+ *
+ * Self-healing: the SIGALRM watchdog is armed per frame and kills the
+ * daemon if an ioctl hangs (the vendor driver has spinlock-leak error
+ * paths). The client sees EOF, respawns the daemon, and the claim
+ * request's release-first dance reclaims the orphaned channel - that is
+ * exactly what the dance exists for.
+ *
+ * Every frame logs per-phase microsecond timings to /tmp/jz-daemon.log so
+ * the true in-process swap cost is measured, not guessed.
+ */
+static void daemon_log_ts(struct timespec *last, const char *phase)
+{
+	struct timespec now;
+	long long us;
+	FILE *f;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	us = (now.tv_sec - last->tv_sec) * 1000000LL +
+	     (now.tv_nsec - last->tv_nsec) / 1000;
+	*last = now;
+	f = fopen("/tmp/jz-daemon.log", "a");
+	if (f) {
+		fprintf(f, "P %-5s %lld us\n", phase, us);
+		fclose(f);
+	}
+}
+
+static int recv_full(int cfd, void *buf, size_t len)
+{
+	char *p = buf;
+
+	while (len > 0) {
+		ssize_t n = recv(cfd, p, len, 0);
+
+		if (n <= 0)
+			return -1;
+		p += n;
+		len -= (size_t)n;
+	}
+	return 0;
+}
+
+static int cmd_serve(int fd, const char *gpio, long prescale)
+{
+	struct pwm_config_args cfg;
+	struct pwm_ch_value v;
+	struct pwm_dma_init_args di;
+	struct pwm_dma_op_args op;
+	static uint32_t words[65536];
+	struct sockaddr_un addr;
+	struct timespec ts;
+	struct pollfd pfd;
+	FILE *log;
+	int sfd, cfd, ch;
+
+	/* main() already holds the instance lock for this process - keeping
+	 * it for the daemon's lifetime is what makes us sole owner: one-shot
+	 * fx-pwm invocations refuse silently while we run, by design. The
+	 * startup watchdog would kill an idle daemon; playback re-arms a
+	 * per-frame alarm instead. A client that times out and closes the
+	 * socket mid-dance must cost us an EPIPE, not our life. */
+	alarm(0);
+	signal(SIGPIPE, SIG_IGN);
+
+	ch = pwm_request_channel(fd, gpio);
+	pwm_release_channel(fd, ch, gpio);
+	ch = pwm_request_channel(fd, gpio);
+	arm_signal_release(fd, ch, gpio);
+
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.active_level = 1;
+	cfg.levels_exact = 0;
+	cfg.freq_hz = 1000000; /* conservative: see cmd_tone */
+	cfg.max_level = 300;
+	cfg.channel = (uint32_t)ch;
+	xioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg, "pwm_config");
+
+	v.channel = (uint32_t)ch;
+	v.value = (uint32_t)prescale;
+	xioctl(fd, ioc_SET_PRESCALE(PWM_IOC_SET_PRESCALE), &v, "pwm_set_prescale");
+
+	unlink("/tmp/fx-pwm.sock");
+	sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (sfd < 0)
+		die("error: socket: %s\n", strerror(errno));
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, "/tmp/fx-pwm.sock", sizeof(addr.sun_path) - 1);
+	if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+		die("error: bind /tmp/fx-pwm.sock: %s\n", strerror(errno));
+	chmod("/tmp/fx-pwm.sock", 0666);
+	if (listen(sfd, 1) < 0)
+		die("error: listen: %s\n", strerror(errno));
+
+	log = fopen("/tmp/jz-daemon.log", "a");
+	if (log) {
+		fprintf(log, "# serve start ch=%d prescale=%ld\n", ch, prescale);
+		fclose(log);
+	}
+	step("serve: ch%d on /tmp/fx-pwm.sock\n", ch);
+
+	for (;;) {
+		/* Idle-exit: holding the instance lock forever starves the
+		 * one-shot fx-pwm invocations klippy's M300/TONE path still
+		 * uses. With no client connected for this long, release the
+		 * channel and exit - the app respawns us on the next sound. */
+		{
+			struct pollfd idle;
+			int r;
+
+			idle.fd = sfd;
+			idle.events = POLLIN;
+			r = poll(&idle, 1, 30000);
+			if (r == 0) {
+				step("serve: idle, exiting\n");
+				return 0;
+			}
+			if (r < 0)
+				continue;
+		}
+
+		cfd = accept(sfd, NULL, NULL);
+		if (cfd < 0)
+			continue;
+
+		while (1) {
+			uint32_t head[3];
+			uint32_t hold_ms, nwords;
+			uint8_t reply;
+			int idle_r;
+
+			/* Connected idle also expires: the app keeps its
+			 * socket open between sounds, and a daemon parked
+			 * forever on a live connection holds the lock just
+			 * as tightly as one stuck in accept(). */
+			pfd.fd = cfd;
+			pfd.events = POLLIN;
+			idle_r = poll(&pfd, 1, 30000);
+			if (idle_r == 0) {
+				step("serve: client idle, exiting\n");
+				close(cfd);
+				return 0;
+			}
+			if (idle_r < 0)
+				break;
+
+			if (recv_full(cfd, head, sizeof(head)) < 0)
+				break; /* client gone: wait for reconnect */
+			if (head[0] != 0x4A5A5331u) {
+				/* Interleaved or corrupt stream: any attempt to
+				 * resync mid-garbage just wedges both sides
+				 * (the client blocked in write, us blocked in
+				 * a read for a length that never comes).
+				 * Close: the client reconnects clean. */
+				step("serve: bad magic, dropping client\n");
+				break;
+			}
+			hold_ms = head[1];
+			nwords = head[2];
+			if (nwords == 0) { /* cancel: stop the current hold */
+				if (ioctl(fd, ioc_DMA_DISABLE_LOOP(
+						   PWM_IOC_DMA_DISABLE_LOOP),
+					  (unsigned long)ch) == 0)
+					g_cancel_hold = 1;
+				continue; /* no reply: fire-and-forget */
+			}
+			if (nwords > 65536 || nwords % 4 != 0 ||
+			    recv_full(cfd, words, nwords * 4) < 0) {
+				step("serve: bad length, dropping client\n");
+				break;
+			}
+
+			/* Receipt ack NOW, before any ioctl: the client's
+			 * send path must never wait on playback. 1 = the
+			 * previous hold is still running, this frame is
+			 * dropped (the client reschedules). */
+			reply = g_holding ? 1 : 0;
+			send(cfd, &reply, 1, 0);
+			if (reply == 1)
+				continue;
+
+			/* Watchdog covers the WHOLE frame - the buffer copy
+			 * alone can take seconds on the big phrase frames,
+			 * and an ioctl that hangs with no alarm armed is
+			 * what froze the first daemon. */
+			alarm((unsigned)(hold_ms / 1000) + 5);
+			g_cancel_hold = 0;
+			g_holding = 1;
+			clock_gettime(CLOCK_MONOTONIC, &ts);
+
+			/* The driver refuses a second dma_init while the
+			 * channel still reads "working" (EPERM, "Cannot
+			 * configure at working" in dmesg) - the
+			 * release/re-request dance every fx-pwm invocation
+			 * performs is what resets that state. It ran clean
+			 * for hundreds of cycles in tone_player; doing it
+			 * per frame is what makes the daemon multi-shot. */
+			pwm_release_channel(fd, ch, gpio);
+			ch = pwm_request_channel(fd, gpio);
+			memset(&cfg, 0, sizeof(cfg));
+			cfg.active_level = 1;
+			cfg.levels_exact = 0;
+			cfg.freq_hz = 1000000;
+			cfg.max_level = 300;
+			cfg.channel = (uint32_t)ch;
+			xioctl(fd, ioc_CONFIG(PWM_IOC_CONFIG), &cfg,
+			       "pwm_config");
+			v.channel = (uint32_t)ch;
+			v.value = (uint32_t)prescale;
+			xioctl(fd, ioc_SET_PRESCALE(PWM_IOC_SET_PRESCALE), &v,
+			       "pwm_set_prescale");
+			daemon_log_ts(&ts, "rq");
+
+			memset(&di, 0, sizeof(di));
+			di.channel = (uint32_t)ch;
+			di.active_level = 1;
+			di.loop = 1;
+			xioctl(fd, ioc_DMA_INIT(PWM_IOC_DMA_INIT), &di,
+			       "pwm_dma_init");
+			daemon_log_ts(&ts, "init");
+
+			memset(&op, 0, sizeof(op));
+			op.channel = (uint32_t)ch;
+			op.count = nwords;
+			op.data = (uint32_t)(uintptr_t)words;
+			op.op = 0;
+			xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op,
+			       "pwm_dma_update");
+			daemon_log_ts(&ts, "upd");
+			op.op = 1;
+			xioctl(fd, ioc_DMA_OP(PWM_IOC_DMA_OP), &op,
+			       "pwm_dma_enable_loop");
+			daemon_log_ts(&ts, "ena");
+
+			/* The hold ends at an ABSOLUTE deadline: poll()'s
+			 * timeout restarts on every readable event, and a
+			 * client that resends instantly makes the socket
+			 * perpetually readable - without a deadline the hold
+			 * extends forever and the loop replays one phrase
+			 * endlessly. */
+			{
+				struct timespec dl;
+				long long deadline_us;
+
+				clock_gettime(CLOCK_MONOTONIC, &dl);
+				deadline_us = dl.tv_sec * 1000000LL +
+					      dl.tv_nsec / 1000 +
+					      (long long)hold_ms * 1000;
+				while (!g_cancel_hold) {
+					int r;
+					long long remain_us;
+
+					clock_gettime(CLOCK_MONOTONIC, &dl);
+					remain_us = deadline_us -
+						    (dl.tv_sec * 1000000LL +
+						     dl.tv_nsec / 1000);
+					if (remain_us <= 0)
+						break;
+					pfd.fd = cfd;
+					pfd.events = POLLIN;
+					r = poll(&pfd, 1,
+						 (int)(remain_us / 1000 + 1));
+					if (r <= 0)
+						break; /* deadline reached */
+					/* something arrived mid-hold: cancel (0)
+					 * or a full frame to discard */
+					{
+						uint32_t peek[3];
+
+						if (recv_full(cfd, peek,
+							      sizeof(peek)) < 0)
+							break;
+						if (peek[2] == 0) {
+							g_cancel_hold = 1;
+							break;
+						}
+						/* drain the frame body, ack 1 */
+						while (peek[2] > 0) {
+							uint32_t chunk =
+								peek[2] > 65536
+									? 65536
+									: peek[2];
+							if (recv_full(cfd, words,
+								      chunk * 4) < 0)
+								break;
+							peek[2] -= chunk;
+						}
+						reply = 1;
+						send(cfd, &reply, 1, 0);
+					}
+				}
+			}
+			daemon_log_ts(&ts, "hold");
+
+			dma_silence(fd, ch);
+			alarm(0);
+			g_holding = 0;
+			daemon_log_ts(&ts, "dis");
+
+			log = fopen("/tmp/jz-daemon.log", "a");
+			if (log) {
+				fprintf(log,
+					"F words=%u hold=%u cancel=%d\n",
+					nwords, hold_ms, g_cancel_hold);
+				fclose(log);
+			}
+		}
+		close(cfd);
+	}
+	return 0; /* unreachable: the accept loop only exits by signal */
 }
 
 /*
@@ -1230,6 +1674,35 @@ int main(int argc, char **argv)
 				die("error: not support this arg: %s\n", argv[i]);
 		}
 		return cmd_words(fd, gpio, argv[3], ms, prescale);
+	}
+	if (strcmp(verb, "chunks") == 0) {
+		long chunk_ms = 500, base = 50000000, prescale = 6;
+		int n_chunks = 8;
+
+		for (i = 4; i < argc; i++) {
+			if (strncmp(argv[i], "--ms=", 5) == 0)
+				chunk_ms = parse_long(argv[i] + 5, "ms");
+			else if (strncmp(argv[i], "--n=", 4) == 0)
+				n_chunks = (int)parse_long(argv[i] + 4, "n");
+			else if (strncmp(argv[i], "--base=", 7) == 0)
+				base = parse_long(argv[i] + 7, "base");
+			else if (strncmp(argv[i], "--prescale=", 11) == 0)
+				prescale = parse_long(argv[i] + 11, "prescale");
+			else if (strncmp(argv[i], "--", 2) != 0)
+				die("error: not support this arg: %s\n", argv[i]);
+		}
+		return cmd_chunks(fd, gpio, chunk_ms, n_chunks, base, prescale);
+	}
+	if (strcmp(verb, "serve") == 0) {
+		long prescale = 2;
+
+		for (i = 3; i < argc; i++) {
+			if (strncmp(argv[i], "--prescale=", 11) == 0)
+				prescale = parse_long(argv[i] + 11, "prescale");
+			else if (strncmp(argv[i], "--", 2) != 0)
+				die("error: not support this arg: %s\n", argv[i]);
+		}
+		return cmd_serve(fd, gpio, prescale);
 	}
 	if (strcmp(verb, "probe") == 0)
 		return cmd_probe(fd, gpio);
