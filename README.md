@@ -26,7 +26,7 @@ buildroot/
 
 ## Building
 
-On the build host (zeus), with the tree checked out:
+On any Linux build host with Docker, with the tree checked out:
 
 ```sh
 cd forgex-br/buildroot
